@@ -14,10 +14,50 @@ import os
 import traceback
 import glob
 import tempfile
+import time
+import random
+import requests
+from requests_cache import CacheMixin, SQLiteCache
+from requests_ratelimiter import LimiterMixin, MemoryQueueBucket
+from pyrate_limiter import Duration, RequestRate, Limiter
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Create a session that respects rate limits and uses caching
+class CachedLimiterSession(CacheMixin, LimiterMixin, requests.Session):
+    pass
+
+# Define rate limits based on Yahoo Finance's typical limits
+# We'll use conservative values to be safe
+yf_limiter = Limiter(
+    RequestRate(60, Duration.MINUTE),  # Max 60 requests per minute
+    RequestRate(300, Duration.HOUR),   # Max 300 requests per hour
+    RequestRate(2000, Duration.DAY)    # Max 2000 requests per day
+)
+
+# Create caching directory
+CACHE_DIR = os.path.join(tempfile.gettempdir(), "stock_predictor_cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+CACHE_DB = os.path.join(CACHE_DIR, "yfinance_cache")
+
+# Create cached limiter session for Yahoo Finance
+yf_session = CachedLimiterSession(
+    limiter=yf_limiter,
+    bucket_class=MemoryQueueBucket,
+    backend=SQLiteCache(CACHE_DB, expire_after=timedelta(days=1))
+)
+
+# Set a user agent that rotates to avoid detection
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0'
+]
+yf_session.headers['User-Agent'] = random.choice(USER_AGENTS)
 
 # Initialize sentiment analyzer
 sentiment_analyzer = SentimentIntensityAnalyzer()
@@ -25,10 +65,6 @@ sentiment_analyzer = SentimentIntensityAnalyzer()
 # NewsAPI configuration
 NEWS_API_KEY = "faa59dc97acf42f1acdada2e9c9e4155"  # Replace with your actual API key
 newsapi = NewsApiClient(api_key=NEWS_API_KEY)
-
-# Define a temporary directory for cache files
-CACHE_DIR = os.path.join(tempfile.gettempdir(), "stock_predictor_cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
 
 # Indian stock exchanges and their Yahoo Finance suffixes
 INDIAN_EXCHANGES = {
@@ -61,27 +97,46 @@ MARKET_INDICES = {
     }
 }
 
-def clean_cache_files():
-    """Delete all cached stock data files that are older than 1 day."""
+def clean_cache_files(max_age_days=7):
+    """Delete cached stock data files that are older than specified days."""
     try:
         cache_pattern = os.path.join(CACHE_DIR, "*_data.csv")
         cache_files = glob.glob(cache_pattern)
         
         current_time = datetime.now()
         deleted_count = 0
+        kept_count = 0
         
         for file_path in cache_files:
             file_time = datetime.fromtimestamp(os.path.getmtime(file_path))
-            if current_time - file_time > timedelta(days=1):
+            if current_time - file_time > timedelta(days=max_age_days):
                 os.remove(file_path)
                 deleted_count += 1
+            else:
+                kept_count += 1
                 
-        logger.info(f"Cleaned {deleted_count} old cache files")
+        logger.info(f"Cache cleanup: removed {deleted_count} old files, kept {kept_count} recent files")
+        return deleted_count, kept_count
     except Exception as e:
         logger.error(f"Error cleaning cache files: {str(e)}")
+        return 0, 0
 
-def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True):
-    """Fetch stock data from Yahoo Finance and optionally cache it locally."""
+def throttled_api_call(func, *args, **kwargs):
+    """Utility function to throttle API calls and avoid rate limiting."""
+    # Add a small random delay (100-500ms) to spread out requests
+    time.sleep(random.uniform(0.1, 0.5))
+    
+    try:
+        return func(*args, **kwargs)
+    except Exception as e:
+        if "rate" in str(e).lower() or "limit" in str(e).lower():
+            # If rate limited, add a longer delay before returning
+            logger.warning(f"Rate limiting detected, adding delay: {str(e)}")
+            time.sleep(random.uniform(1.0, 3.0))
+        raise
+
+def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_retries=3, retry_delay=2):
+    """Fetch stock data from Yahoo Finance using rate limit aware session."""
     # Format ticker with exchange suffix if Indian exchange is selected
     formatted_ticker = ticker
     if exchange and exchange in INDIAN_EXCHANGES:
@@ -94,65 +149,106 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True):
         file_time = datetime.fromtimestamp(os.path.getmtime(cache_file))
         if datetime.now() - file_time < timedelta(days=1):
             logger.info(f"Using cached data for {formatted_ticker}")
-            return pd.read_csv(cache_file)
+            return pd.read_csv(cache_file, index_col=0, parse_dates=True)
     
-    try:
-        logger.info(f"Fetching data for {formatted_ticker}")
-        stock = yf.Ticker(formatted_ticker)
-        df = stock.history(period=period)
-        
-        if df.empty:
-            raise ValueError(f"No data found for ticker {formatted_ticker}")
-        
-        # Only save to cache if caching is enabled
-        if use_cache:
-            df.to_csv(cache_file)
-        
-        return df
-    except Exception as e:
-        logger.error(f"Error fetching data for {formatted_ticker}: {str(e)}")
-        if use_cache and os.path.exists(cache_file):
-            logger.warning(f"Falling back to cached data for {formatted_ticker}")
-            return pd.read_csv(cache_file)
-        raise
+    # Try to fetch data with retries
+    retries = 0
+    last_exception = None
+    
+    while retries < max_retries:
+        try:
+            logger.info(f"Fetching data for {formatted_ticker} (attempt {retries+1}/{max_retries})")
+            stock = yf.Ticker(formatted_ticker, session=yf_session)
+            df = stock.history(period=period)
+            
+            if df.empty:
+                raise ValueError(f"No data found for ticker {formatted_ticker}")
+            
+            # Only save to cache if caching is enabled
+            if use_cache:
+                df.to_csv(cache_file)
+            
+            return df
+        except Exception as e:
+            last_exception = e
+            logger.warning(f"Attempt {retries+1}/{max_retries} failed: {str(e)}")
+            retries += 1
+            
+            # If it's not the last retry, wait before trying again
+            if retries < max_retries:
+                time.sleep(retry_delay * (retries + 1))  # Exponential backoff
+    
+    # All retries failed, check for cached data as fallback
+    logger.error(f"Error fetching data for {formatted_ticker} after {max_retries} attempts: {str(last_exception)}")
+    if use_cache and os.path.exists(cache_file):
+        logger.warning(f"Falling back to cached data for {formatted_ticker}")
+        return pd.read_csv(cache_file, index_col=0, parse_dates=True)
+    
+    # If no cache or cache failed, raise a more user-friendly exception
+    raise Exception(f"Could not fetch data for {formatted_ticker}. Yahoo Finance API may be rate-limited. Please try again later or enable caching.")
 
-def fetch_index_data(index_ticker, period="7d"):
-    """Fetch market index data."""
-    try:
-        index = yf.Ticker(index_ticker)
-        df = index.history(period=period)
-        # Return None if no data or not enough data points
-        if df.empty or len(df) < 2:
-            logger.warning(f"Not enough data points for {index_ticker}, got {len(df) if not df.empty else 0}")
-            return None
-        return df
-    except Exception as e:
-        logger.error(f"Error fetching index data for {index_ticker}: {str(e)}")
-        return None
+def fetch_index_data(index_ticker, period="7d", max_retries=3, retry_delay=2):
+    """Fetch market index data with retry mechanism."""
+    retries = 0
+    last_exception = None
+    
+    while retries < max_retries:
+        try:
+            logger.info(f"Fetching index data for {index_ticker} (attempt {retries+1}/{max_retries})")
+            index = yf.Ticker(index_ticker, session=yf_session)
+            df = index.history(period=period)
+            
+            # Return None if no data or not enough data points
+            if df.empty or len(df) < 2:
+                logger.warning(f"Not enough data points for {index_ticker}, got {len(df) if not df.empty else 0}")
+                return None
+            return df
+        except Exception as e:
+            last_exception = e
+            logger.warning(f"Attempt {retries+1}/{max_retries} failed: {str(e)}")
+            retries += 1
+            
+            # If it's not the last retry, wait before trying again
+            if retries < max_retries:
+                time.sleep(retry_delay * (retries + 1))  # Exponential backoff
+    
+    logger.error(f"Error fetching index data for {index_ticker} after {max_retries} attempts: {str(last_exception)}")
+    return None
 
-def get_sentiment_score(ticker):
-    """Fetch news articles and calculate sentiment score."""
-    try:
-        news = newsapi.get_everything(
-            q=ticker,
-            language='en',
-            sort_by='publishedAt',
-            from_param=(datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-        )
-        
-        if not news['articles']:
-            return 0.0
-        
-        sentiment_scores = []
-        for article in news['articles']:
-            if article['title']:
-                sentiment = sentiment_analyzer.polarity_scores(article['title'])
-                sentiment_scores.append(sentiment['compound'])
-        
-        return np.mean(sentiment_scores)
-    except Exception as e:
-        logger.error(f"Error fetching sentiment for {ticker}: {str(e)}")
-        return 0.0
+def get_sentiment_score(ticker, max_retries=2):
+    """Fetch news articles and calculate sentiment score with retry mechanism."""
+    for attempt in range(max_retries):
+        try:
+            news = newsapi.get_everything(
+                q=ticker,
+                language='en',
+                sort_by='publishedAt',
+                from_param=(datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d'),
+                page_size=10  # Limit to fewer articles to avoid rate limits
+            )
+            
+            if not news['articles']:
+                logger.warning(f"No news articles found for {ticker}")
+                return 0.0
+            
+            sentiment_scores = []
+            for article in news['articles']:
+                if article['title']:
+                    sentiment = sentiment_analyzer.polarity_scores(article['title'])
+                    sentiment_scores.append(sentiment['compound'])
+            
+            if not sentiment_scores:
+                return 0.0
+                
+            return np.mean(sentiment_scores)
+        except Exception as e:
+            logger.error(f"Error fetching sentiment for {ticker} (attempt {attempt+1}/{max_retries}): {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(2)  # Wait before retry
+    
+    # If all retries fail, return neutral sentiment
+    logger.warning(f"Using neutral sentiment for {ticker} after {max_retries} failed attempts")
+    return 0.0
 
 def preprocess_data(df):
     """Preprocess stock data and calculate technical indicators."""
@@ -345,193 +441,302 @@ def main():
     selected_period = st.sidebar.selectbox("Select Time Period", list(period_options.keys()))
     period = period_options[selected_period]
     
-    # Add caching option
-    use_cache = st.sidebar.checkbox("Use local cache", value=False, 
-                                  help="Enable to cache data locally for faster loading. Disable to always fetch fresh data.")
+    # Add caching option - now enabled by default
+    use_cache = st.sidebar.checkbox("Use local cache", value=True, 
+                                  help="Enable to cache data locally for faster loading and to avoid rate limiting. Disable to always fetch fresh data.")
     
-    # Add button to clean cache
+    # Show cache info and add button to clean cache
+    cache_files = glob.glob(os.path.join(CACHE_DIR, "*_data.csv"))
+    if cache_files:
+        oldest_file = min(cache_files, key=lambda x: os.path.getmtime(x))
+        oldest_time = datetime.fromtimestamp(os.path.getmtime(oldest_file))
+        newest_file = max(cache_files, key=lambda x: os.path.getmtime(x))
+        newest_time = datetime.fromtimestamp(os.path.getmtime(newest_file))
+        
+        st.sidebar.markdown(f"**Cache Info:**")
+        st.sidebar.markdown(f"• {len(cache_files)} cached stock files")
+        st.sidebar.markdown(f"• Oldest: {oldest_time.strftime('%Y-%m-%d %H:%M')}")
+        st.sidebar.markdown(f"• Newest: {newest_time.strftime('%Y-%m-%d %H:%M')}")
+    
     if st.sidebar.button("Clear Cached Data"):
-        clean_cache_files()
-        st.sidebar.success("Cache cleared successfully!")
+        deleted_count, kept_count = clean_cache_files()
+        st.sidebar.success(f"Cache cleared successfully! Removed {deleted_count} old files, kept {kept_count} recent files")
+        st.experimental_rerun()  # Rerun the app to refresh the cache info
+    
+    # Rate limit warning
+    st.sidebar.markdown("---")
+    st.sidebar.warning("⚠️ Yahoo Finance enforces rate limits. The app now includes automatic rate limiting and caching to avoid disruptions.")
     
     # Main content area
     col1, col2 = st.columns([2, 1])
     
     try:
         with st.spinner("Fetching stock data..."):
-            df = fetch_stock_data(ticker, period=period, exchange=exchange, use_cache=use_cache)
-            df = preprocess_data(df)
-            
-            # Display stock info
-            formatted_ticker = ticker
-            if exchange and exchange in INDIAN_EXCHANGES:
-                formatted_ticker = f"{ticker}{INDIAN_EXCHANGES[exchange]}"
-            
-            stock = yf.Ticker(formatted_ticker)
-            info = stock.info
-            
-            with col1:
-                st.subheader(f"Stock Information: {formatted_ticker}")
-                st.write(f"Company Name: {info.get('longName', 'N/A')}")
+            try:
+                # Format ticker for display
+                formatted_ticker = ticker
+                if exchange and exchange in INDIAN_EXCHANGES:
+                    formatted_ticker = f"{ticker}{INDIAN_EXCHANGES[exchange]}"
                 
-                # Handle different price fields for different markets
-                if 'currentPrice' in info:
-                    current_price = info['currentPrice']
-                elif 'regularMarketPrice' in info:
-                    current_price = info['regularMarketPrice']
+                # Cache path for this specific request
+                cache_file = os.path.join(CACHE_DIR, f"{formatted_ticker}_{period}_data.csv")
+                
+                # Try to load from cache first if enabled
+                if use_cache and os.path.exists(cache_file):
+                    file_time = datetime.fromtimestamp(os.path.getmtime(cache_file))
+                    if datetime.now() - file_time < timedelta(days=1):
+                        logger.info(f"Using cached data for {formatted_ticker}")
+                        df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
                 else:
-                    current_price = "N/A"
-                
-                # Determine currency symbol based on exchange
-                currency_symbol = "₹" if exchange else "$"
-                
-                st.write(f"Current Price: {current_price if current_price == 'N/A' else f'{currency_symbol}{current_price:.2f}'}")
-                st.write(f"Market Cap: {currency_symbol}{info.get('marketCap', 0):,.0f}")
-                st.write(f"52 Week High: {currency_symbol}{info.get('fiftyTwoWeekHigh', 'N/A'):.2f}" if info.get('fiftyTwoWeekHigh') else "52 Week High: N/A")
-                st.write(f"52 Week Low: {currency_symbol}{info.get('fiftyTwoWeekLow', 'N/A'):.2f}" if info.get('fiftyTwoWeekLow') else "52 Week Low: N/A")
-                
-                # Display volume information
-                if 'volume' in info:
-                    st.write(f"Volume: {info['volume']:,.0f}")
-                elif 'regularMarketVolume' in info:
-                    st.write(f"Volume: {info['regularMarketVolume']:,.0f}")
-                
-                # Display exchange information
-                if exchange:
-                    st.write(f"Exchange: {exchange}")
+                    # Use yf.download with the rate limited session instead of fetch_stock_data
+                    logger.info(f"Downloading data for {formatted_ticker} using rate-limited session")
+                    df = yf.download(
+                        tickers=formatted_ticker,
+                        period=period,
+                        auto_adjust=True,
+                        progress=False,
+                        session=yf_session
+                    )
                     
-                # Display relevant market indices
-                st.subheader("Market Indices")
-                indices = MARKET_INDICES["India"] if exchange else MARKET_INDICES["USA"]
+                    # Save to cache if caching is enabled
+                    if use_cache:
+                        df.to_csv(cache_file)
                 
-                indices_data = []
-                for name, idx_ticker in indices.items():
-                    try:
-                        idx_data = fetch_index_data(idx_ticker)
-                        if idx_data is not None and len(idx_data) >= 2:
-                            latest_price = idx_data['Close'].iloc[-1]
-                            prev_price = idx_data['Close'].iloc[-2]
-                            pct_change = ((latest_price - prev_price) / prev_price) * 100
-                            color = "green" if pct_change >= 0 else "red"
-                            indices_data.append({
-                                "name": name,
-                                "price": latest_price,
-                                "change": pct_change,
-                                "color": color
-                            })
-                        else:
-                            logger.warning(f"Not enough data for index {name}, skipping")
-                    except Exception as e:
-                        logger.error(f"Error processing index {name}: {str(e)}")
-                        continue
+                # Preprocess data
+                df = preprocess_data(df)
                 
-                # Create a small dataframe for the indices
-                if indices_data:
-                    st.write("Latest market index values:")
-                    for idx in indices_data:
-                        st.write(f"{idx['name']}: {idx['price']:.2f} ({idx['change']:.2f}%)")
-                else:
-                    st.write("Market index data currently unavailable")
+                if df.empty:
+                    st.error(f"No data found for ticker {formatted_ticker}")
+                    return
+            except Exception as e:
+                st.error(f"Error fetching stock data: {str(e)}")
+                st.warning("Try enabling caching or wait a few minutes before trying again.")
+                return
             
-            # Plot trends
-            fig = plot_trends(df)
-            st.pyplot(fig)
+            try:
+                # Display stock info
+                stock = yf.Ticker(formatted_ticker, session=yf_session)
+                try:
+                    info = stock.info
+                except:
+                    # Create a minimal info dict if we can't get the actual info
+                    info = {}
+                
+                with col1:
+                    st.subheader(f"Stock Information: {formatted_ticker}")
+                    
+                    # Only show available information
+                    if 'longName' in info:
+                        st.write(f"Company Name: {info.get('longName', 'N/A')}")
+                    
+                    # Handle different price fields for different markets
+                    current_price = "N/A"
+                    if 'currentPrice' in info:
+                        current_price = info['currentPrice']
+                    elif 'regularMarketPrice' in info:
+                        current_price = info['regularMarketPrice']
+                    elif len(df) > 0:
+                        # Use the last close price from our data if available
+                        current_price = df['Close'].iloc[-1]
+                    
+                    # Determine currency symbol based on exchange
+                    currency_symbol = "₹" if exchange else "$"
+                    
+                    st.write(f"Current Price: {current_price if current_price == 'N/A' else f'{currency_symbol}{current_price:.2f}'}")
+                    
+                    if 'marketCap' in info:
+                        st.write(f"Market Cap: {currency_symbol}{info.get('marketCap', 0):,.0f}")
+                    
+                    if 'fiftyTwoWeekHigh' in info:
+                        st.write(f"52 Week High: {currency_symbol}{info.get('fiftyTwoWeekHigh'):.2f}")
+                    
+                    if 'fiftyTwoWeekLow' in info:
+                        st.write(f"52 Week Low: {currency_symbol}{info.get('fiftyTwoWeekLow'):.2f}")
+                    
+                    # Display volume information if available
+                    if 'volume' in info:
+                        st.write(f"Volume: {info['volume']:,.0f}")
+                    elif 'regularMarketVolume' in info:
+                        st.write(f"Volume: {info['regularMarketVolume']:,.0f}")
+                    
+                    # Display exchange information
+                    if exchange:
+                        st.write(f"Exchange: {exchange}")
+                    
+                    # Try to display relevant market indices if possible
+                    try:
+                        st.subheader("Market Indices")
+                        indices = MARKET_INDICES["India"] if exchange else MARKET_INDICES["USA"]
+                        
+                        # Use yf.download for batch downloading of indices
+                        indices_tickers = list(indices.values())
+                        indices_data_all = None
+                        
+                        # Try to load indices from cache or download
+                        indices_cache_file = os.path.join(CACHE_DIR, "market_indices_data.csv")
+                        if use_cache and os.path.exists(indices_cache_file):
+                            file_time = datetime.fromtimestamp(os.path.getmtime(indices_cache_file))
+                            if datetime.now() - file_time < timedelta(hours=6):  # 6 hours for indices
+                                indices_data_all = pd.read_csv(indices_cache_file, index_col=0, parse_dates=True)
+                        
+                        if indices_data_all is None:
+                            indices_data_all = yf.download(
+                                tickers=indices_tickers,
+                                period="2d",  # Just need 2 days for current comparison
+                                auto_adjust=True,
+                                progress=False,
+                                group_by='ticker',
+                                session=yf_session
+                            )
+                            
+                            if use_cache:
+                                indices_data_all.to_csv(indices_cache_file)
+                        
+                        # Display indices data
+                        indices_display = []
+                        for name, idx_ticker in indices.items():
+                            try:
+                                if idx_ticker in indices_data_all.columns.levels[0]:
+                                    idx_data = indices_data_all[idx_ticker]
+                                    if len(idx_data) >= 2:
+                                        latest_price = idx_data['Close'].iloc[-1]
+                                        prev_price = idx_data['Close'].iloc[-2]
+                                        pct_change = ((latest_price - prev_price) / prev_price) * 100
+                                        color = "green" if pct_change >= 0 else "red"
+                                        indices_display.append({
+                                            "name": name,
+                                            "price": latest_price,
+                                            "change": pct_change,
+                                            "color": color
+                                        })
+                            except Exception as e:
+                                logger.error(f"Error processing index {name}: {str(e)}")
+                                continue
+                        
+                        # Create a small dataframe for the indices
+                        if indices_display:
+                            st.write("Latest market index values:")
+                            for idx in indices_display:
+                                st.write(f"{idx['name']}: {idx['price']:.2f} ({idx['change']:.2f}%)")
+                        else:
+                            st.write("Market index data currently unavailable")
+                    except Exception as e:
+                        logger.error(f"Error showing indices: {str(e)}")
+                
+                # Plot trends if possible
+                try:
+                    fig = plot_trends(df)
+                    st.pyplot(fig)
+                except Exception as e:
+                    st.error(f"Error plotting trends: {str(e)}")
+            except Exception as e:
+                st.warning(f"Could not load complete stock information: {str(e)}")
+                st.info("Proceeding with available data for analysis.")
             
             # Get sentiment and make prediction
-            with st.spinner("Analyzing news sentiment..."):
-                sentiment_score = get_sentiment_score(ticker)
-                
-                with st.spinner("Training prediction model..."):
+            try:
+                with st.spinner("Analyzing news sentiment..."):
                     try:
-                        # Check if we have enough data for valid model training
-                        if len(df) < 30:  # Require at least 30 days of data
-                            st.warning(f"Not enough historical data for reliable predictions. Found only {len(df)} data points, need at least 30.")
-                            st.info("Try selecting a longer time period or a different stock.")
-                            return
-                            
-                        # Check if all rows have the same target value, which can cause issues
-                        if df['Target'].nunique() == 1:
-                            st.warning(f"All target values are the same ({df['Target'].iloc[0]}). Model won't be able to learn patterns.")
-                            st.info("Try selecting a different time period or stock.")
-                            return
-                        
-                        model, accuracy, feature_importance, feature_names = train_model(df)
-                        prediction, confidence = predict_trend(model, df, sentiment_score, feature_names)
-                        
-                        # Display results
-                        with col2:
-                            st.subheader("Prediction Results")
-                            
-                            # Prediction indicator
-                            prediction_color = "green" if prediction == 1 else "red"
-                            prediction_text = "UP 📈" if prediction == 1 else "DOWN 📉"
-                            st.markdown(f"### <span style='color:{prediction_color}'>{prediction_text}</span>", unsafe_allow_html=True)
-                            
-                            # Confidence meter
-                            st.write("Confidence Score:")
-                            st.progress(min(max(confidence, 0.0), 1.0))  # Ensure confidence is between 0 and 1
-                            st.write(f"{confidence:.2%}")
-                            
-                            # Additional metrics
-                            st.write("Model Accuracy:", f"{accuracy:.2%}")
-                            st.write("Sentiment Score:", f"{sentiment_score:.2f}")
-                            
-                            # Sentiment interpretation
-                            if sentiment_score > 0.2:
-                                st.write("News Sentiment: Very Positive 😊")
-                            elif sentiment_score > 0:
-                                st.write("News Sentiment: Slightly Positive 🙂")
-                            elif sentiment_score < -0.2:
-                                st.write("News Sentiment: Very Negative 😟")
-                            elif sentiment_score < 0:
-                                st.write("News Sentiment: Slightly Negative 😕")
-                            else:
-                                st.write("News Sentiment: Neutral 😐")
-                            
-                            # Mean Reversion Analysis
-                            st.subheader("Mean Reversion Analysis")
-                            
-                            if 'Reversion_Score' in df.columns:
-                                reversion_score = df['Reversion_Score'].iloc[-1]
-                                st.write(f"Reversion Score: {reversion_score:.1f}/6.0")
-                                
-                                # Reversion strength interpretation
-                                if reversion_score >= 4:
-                                    st.write("Strong potential for price reversion 🔄")
-                                elif reversion_score >= 2:
-                                    st.write("Moderate potential for price reversion ↔️")
-                                else:
-                                    st.write("Low potential for price reversion ➡️")
-                            
-                            if 'RSI' in df.columns:
-                                rsi_value = df['RSI'].iloc[-1]
-                                st.write(f"RSI: {rsi_value:.1f}")
-                                
-                                if rsi_value > 70:
-                                    st.write("Overbought condition - potential downward reversion")
-                                elif rsi_value < 30:
-                                    st.write("Oversold condition - potential upward reversion")
-                            
-                            # Feature importance
-                            st.subheader("Feature Importance")
-                            if not feature_importance.empty:
-                                # Display top 5 features only
-                                top_features = feature_importance.head(min(5, len(feature_importance)))
-                                st.bar_chart(data=top_features.set_index('Feature')['Importance'])
-                    except ValueError as ve:
-                        st.error(f"Value Error in model: {str(ve)}")
-                        logger.error(f"Value Error in model: {str(ve)}\n{traceback.format_exc()}")
-                    except IndexError as ie:
-                        st.error(f"Index Error in model: {str(ie)}")
-                        logger.error(f"Index Error in model: {str(ie)}\n{traceback.format_exc()}")
+                        sentiment_score = get_sentiment_score(ticker)
                     except Exception as e:
-                        st.error(f"Error in model training or prediction: {str(e)}")
-                        logger.error(f"Model error: {str(e)}\n{traceback.format_exc()}")
+                        logger.error(f"Error getting sentiment: {str(e)}")
+                        sentiment_score = 0.0
+                        st.warning("News sentiment analysis unavailable. Using neutral sentiment.")
+                    
+                    with st.spinner("Training prediction model..."):
+                        try:
+                            # Check if we have enough data for valid model training
+                            if len(df) < 30:  # Require at least 30 days of data
+                                st.warning(f"Not enough historical data for reliable predictions. Found only {len(df)} data points, need at least 30.")
+                                st.info("Try selecting a longer time period or a different stock.")
+                                return
+                                
+                            # Check if all rows have the same target value, which can cause issues
+                            if df['Target'].nunique() == 1:
+                                st.warning(f"All target values are the same ({df['Target'].iloc[0]}). Model won't be able to learn patterns.")
+                                st.info("Try selecting a different time period or stock.")
+                                return
+                            
+                            model, accuracy, feature_importance, feature_names = train_model(df)
+                            prediction, confidence = predict_trend(model, df, sentiment_score, feature_names)
+                            
+                            # Display results
+                            with col2:
+                                st.subheader("Prediction Results")
+                                
+                                # Prediction indicator
+                                prediction_color = "green" if prediction == 1 else "red"
+                                prediction_text = "UP 📈" if prediction == 1 else "DOWN 📉"
+                                st.markdown(f"### <span style='color:{prediction_color}'>{prediction_text}</span>", unsafe_allow_html=True)
+                                
+                                # Confidence meter
+                                st.write("Confidence Score:")
+                                st.progress(min(max(confidence, 0.0), 1.0))  # Ensure confidence is between 0 and 1
+                                st.write(f"{confidence:.2%}")
+                                
+                                # Additional metrics
+                                st.write("Model Accuracy:", f"{accuracy:.2%}")
+                                st.write("Sentiment Score:", f"{sentiment_score:.2f}")
+                                
+                                # Sentiment interpretation
+                                if sentiment_score > 0.2:
+                                    st.write("News Sentiment: Very Positive 😊")
+                                elif sentiment_score > 0:
+                                    st.write("News Sentiment: Slightly Positive 🙂")
+                                elif sentiment_score < -0.2:
+                                    st.write("News Sentiment: Very Negative 😟")
+                                elif sentiment_score < 0:
+                                    st.write("News Sentiment: Slightly Negative 😕")
+                                else:
+                                    st.write("News Sentiment: Neutral 😐")
+                                
+                                # Mean Reversion Analysis
+                                st.subheader("Mean Reversion Analysis")
+                                
+                                if 'Reversion_Score' in df.columns:
+                                    reversion_score = df['Reversion_Score'].iloc[-1]
+                                    st.write(f"Reversion Score: {reversion_score:.1f}/6.0")
+                                    
+                                    # Reversion strength interpretation
+                                    if reversion_score >= 4:
+                                        st.write("Strong potential for price reversion 🔄")
+                                    elif reversion_score >= 2:
+                                        st.write("Moderate potential for price reversion ↔️")
+                                    else:
+                                        st.write("Low potential for price reversion ➡️")
+                                
+                                if 'RSI' in df.columns:
+                                    rsi_value = df['RSI'].iloc[-1]
+                                    st.write(f"RSI: {rsi_value:.1f}")
+                                    
+                                    if rsi_value > 70:
+                                        st.write("Overbought condition - potential downward reversion")
+                                    elif rsi_value < 30:
+                                        st.write("Oversold condition - potential upward reversion")
+                                
+                                # Feature importance
+                                st.subheader("Feature Importance")
+                                if not feature_importance.empty:
+                                    # Display top 5 features only
+                                    top_features = feature_importance.head(min(5, len(feature_importance)))
+                                    st.bar_chart(data=top_features.set_index('Feature')['Importance'])
+                        except ValueError as ve:
+                            st.error(f"Value Error in model: {str(ve)}")
+                            logger.error(f"Value Error in model: {str(ve)}\n{traceback.format_exc()}")
+                        except IndexError as ie:
+                            st.error(f"Index Error in model: {str(ie)}")
+                            logger.error(f"Index Error in model: {str(ie)}\n{traceback.format_exc()}")
+                        except Exception as e:
+                            st.error(f"Error in model training or prediction: {str(e)}")
+                            logger.error(f"Model error: {str(e)}\n{traceback.format_exc()}")
+            except Exception as e:
+                st.error(f"Error in analysis: {str(e)}")
+                logger.error(f"Analysis error: {str(e)}\n{traceback.format_exc()}")
     
     except Exception as e:
         st.error(f"An error occurred: {str(e)}")
         logger.error(f"Application error: {str(e)}\n{traceback.format_exc()}")
-        st.write("Please check if the ticker symbol is valid and try again.")
+        st.warning("Try enabling caching or wait a few minutes before trying again.")
 
 if __name__ == "__main__":
     main() 
