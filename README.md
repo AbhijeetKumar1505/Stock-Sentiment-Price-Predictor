@@ -65,17 +65,17 @@ This project predicts whether a stock's price will rise or fall based on histori
    ```bash
    pip install -r requirements.txt
    ```
-3. Replace the NewsAPI key in `stock_predictor.py`:
+3. Replace the NewsAPI key in the application:
    ```python
    NEWS_API_KEY = "YOUR_API_KEY"  # Replace with your actual API key
    ```
 
 ## Usage
 
+### Web Interface (Recommended)
 Run the Streamlit app:
-
 ```bash
-streamlit run stock_predictor.py
+streamlit run streamlit_app.py
 ```
 
 ### Web Interface Features
