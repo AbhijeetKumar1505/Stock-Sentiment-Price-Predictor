@@ -40,14 +40,14 @@ yf_limiter = Limiter(
     RequestRate(50, Duration.DAY)         # Max 50 requests per day
 )
 
-# Create caching directory
-CACHE_DIR = os.path.join(tempfile.gettempdir(), "stock_predictor_cache")
+# Create caching directory - use a more persistent location for Streamlit cloud
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stock_predictor_cache")
 try:
     os.makedirs(CACHE_DIR, exist_ok=True)
     logger.info(f"Cache directory created at: {CACHE_DIR}")
 except Exception as e:
     logger.error(f"Failed to create cache directory: {str(e)}")
-    CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+    CACHE_DIR = os.path.join(tempfile.gettempdir(), "stock_predictor_cache")
     os.makedirs(CACHE_DIR, exist_ok=True)
     logger.info(f"Using fallback cache directory at: {CACHE_DIR}")
 
@@ -57,7 +57,7 @@ CACHE_DB = os.path.join(CACHE_DIR, "yfinance_cache")
 yf_session = CachedLimiterSession(
     limiter=yf_limiter,
     bucket_class=MemoryQueueBucket,
-    backend=SQLiteCache(CACHE_DB, expire_after=timedelta(days=7))  # Cache for 7 days
+    backend=SQLiteCache(CACHE_DB, expire_after=timedelta(days=30))  # Cache for 30 days
 )
 
 # Set a user agent that rotates to avoid detection
@@ -72,21 +72,38 @@ yf_session.headers['User-Agent'] = random.choice(USER_AGENTS)
 
 # Function to make a rate-limited request
 def make_rate_limited_request(func, *args, **kwargs):
-    max_retries = 3  # Reduced from 5 to 3
+    max_retries = 3
     retry_count = 0
     
     while retry_count < max_retries:
         try:
             # Add initial delay between requests
             if retry_count == 0:
-                time.sleep(5)  # Initial 5 second delay
+                time.sleep(10)  # Increased initial delay to 10 seconds
             
             # Rotate user agent
             yf_session.headers['User-Agent'] = random.choice(USER_AGENTS)
-            return func(*args, **kwargs)
+            
+            # Try to get from cache first
+            cache_key = f"{func.__name__}_{args}_{kwargs}"
+            if hasattr(yf_session, 'cache') and yf_session.cache:
+                cached_response = yf_session.cache.get(cache_key)
+                if cached_response:
+                    logger.info("Using cached response")
+                    return cached_response
+            
+            # If not in cache, make the request
+            response = func(*args, **kwargs)
+            
+            # Cache the response
+            if hasattr(yf_session, 'cache') and yf_session.cache:
+                yf_session.cache.set(cache_key, response)
+            
+            return response
+            
         except Exception as e:
             if "rate" in str(e).lower() or "limit" in str(e).lower():
-                wait_time = min(60 * (2 ** retry_count), 600)  # Start with 60s, max 10 minutes
+                wait_time = min(120 * (2 ** retry_count), 1200)  # Start with 120s, max 20 minutes
                 logger.warning(f"Rate limit hit. Waiting {wait_time} seconds before retry {retry_count + 1}/{max_retries}")
                 time.sleep(wait_time)
                 retry_count += 1
