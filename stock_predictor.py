@@ -2,9 +2,6 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
 from newsapi import NewsApiClient
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import matplotlib.pyplot as plt
@@ -20,6 +17,7 @@ import requests
 from requests_cache import CacheMixin, SQLiteCache
 from requests_ratelimiter import LimiterMixin, MemoryQueueBucket
 from pyrate_limiter import Duration, RequestRate, Limiter
+from hybrid_model import HybridStockPredictor
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -168,6 +166,9 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
                 return df
         except Exception as e:
             logger.error(f"Error reading cached data: {str(e)}")
+            df = None
+    else:
+        df = None
     
     # Try to fetch data with retries
     retries = 0
@@ -392,81 +393,55 @@ def preprocess_data(df):
     return df
 
 def train_model(df):
-    """Train Random Forest model on the data."""
+    """Train hybrid model on the data."""
     try:
-        # Include reversion indicators
-        features = ['Daily_Return', 'SMA_20', 'Price_SMA20_Ratio', 'BB_Position', 
-                    'RSI', 'Price_SMA20_Pct_Diff', 'Reversion_Score']
+        # Initialize hybrid model
+        model = HybridStockPredictor(
+            sequence_length=30,
+            lstm_units=50,
+            dropout_rate=0.2,
+            learning_rate=0.001
+        )
         
-        # Check if features exist in the dataframe
-        available_features = [f for f in features if f in df.columns]
-        if not available_features:
-            raise ValueError("No valid features found in the data")
+        # Prepare data
+        X_linear, X_lstm, y = model.prepare_data(df)
         
-        X = df[available_features]
-        y = df['Target']
+        # Train model
+        history = model.train(X_linear, X_lstm, y)
         
-        # Check if we have enough data points
-        if len(X) < 30:
-            raise ValueError(f"Not enough data points for training. Need at least 30, got {len(X)}")
+        # Make predictions on training data
+        combined_pred, linear_pred, lstm_pred = model.predict(X_linear, X_lstm)
         
-        # Check if we have enough positive and negative examples
-        if y.nunique() < 2:
-            raise ValueError("Not enough variation in target variable for training")
+        # Evaluate model
+        metrics = model.evaluate(y, combined_pred)
         
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        return model, metrics, history
         
-        model = RandomForestClassifier(n_estimators=100, random_state=42)
-        model.fit(X_train, y_train)
-        
-        y_pred = model.predict(X_test)
-        accuracy = accuracy_score(y_test, y_pred)
-        
-        # Calculate feature importance
-        feature_importance = pd.DataFrame({
-            'Feature': available_features,
-            'Importance': model.feature_importances_
-        }).sort_values('Importance', ascending=False)
-        
-        return model, accuracy, feature_importance, available_features
     except Exception as e:
         logger.error(f"Error in model training: {str(e)}")
         raise
 
-def predict_trend(model, df, sentiment_score, feature_names):
+def predict_trend(model, df, sentiment_score):
     """Make prediction for next day's trend."""
-    latest_data = df.iloc[-1]
-    
-    # Create input data as a DataFrame with proper column names
-    feature_values = {name: latest_data[name] for name in feature_names}
-    features_df = pd.DataFrame([feature_values])
-    
-    # Ensure the column order matches what the model was trained on
-    features_df = features_df[feature_names]
-    
-    # Get the prediction and confidence
-    prediction = model.predict(features_df)[0]
-    
-    # Safely get confidence scores
     try:
-        prob_scores = model.predict_proba(features_df)
-        if prob_scores.shape[1] >= 2:  # Check if we have at least 2 classes
-            confidence = prob_scores[0][1]
-        else:
-            # If only one class in the output, use a default confidence
-            confidence = 0.5
-            logging.warning("Only one class in prediction probabilities. Using default confidence of 0.5")
+        # Prepare data for prediction
+        X_linear, X_lstm, _ = model.prepare_data(df)
+        
+        # Get predictions
+        combined_pred, linear_pred, lstm_pred = model.predict(X_linear[-1:], X_lstm[-1:])
+        
+        # Calculate confidence based on model agreement and sentiment
+        model_agreement = 1 - abs(linear_pred[0] - lstm_pred[0]) / (abs(linear_pred[0]) + abs(lstm_pred[0]))
+        confidence = 0.7 * model_agreement + 0.3 * (sentiment_score + 1) / 2
+        
+        # Determine trend (1 for up, 0 for down)
+        prediction = 1 if combined_pred[0] > df['Close'].iloc[-1] else 0
+        
+        return prediction, confidence
+        
     except Exception as e:
-        logging.error(f"Error getting prediction probabilities: {str(e)}")
-        confidence = 0.5  # Use a default if there's an error
-    
-    # Adjust confidence based on reversion score and sentiment
-    reversion_confidence = latest_data.get('Reversion_Score', 0) / 6.0  # Normalize to [0,1]
-    
-    # Combine prediction confidence with reversion confidence and sentiment
-    adjusted_confidence = 0.6 * confidence + 0.3 * reversion_confidence + 0.1 * (sentiment_score + 1) / 2
-    
-    return prediction, adjusted_confidence
+        logger.error(f"Error making prediction: {str(e)}")
+        raise
 
 def plot_trends(df):
     """Plot stock price, SMA, and Bollinger Bands."""
@@ -756,7 +731,13 @@ def main():
                             # Handle MultiIndex if present
                             if isinstance(df.columns, pd.MultiIndex):
                                 logger.info(f"Found MultiIndex columns: {df.columns}")
-                                df = df[formatted_ticker]  # Get the data for our specific ticker
+                                # Get the data for our specific ticker
+                                try:
+                                    # Try to get the data using the ticker as a key
+                                    df = df[formatted_ticker]
+                                except KeyError:
+                                    # If that fails, try to get the first level of the MultiIndex
+                                    df = df.xs(df.columns.levels[1][0], level=1, axis=1)
                                 logger.info(f"After MultiIndex handling, shape: {df.shape}")
                                 logger.info(f"After MultiIndex handling, columns: {df.columns}")
                             
@@ -969,8 +950,8 @@ def main():
                                     st.info("Try selecting a different time period or stock.")
                                     return
                                 
-                                model, accuracy, feature_importance, feature_names = train_model(df)
-                                prediction, confidence = predict_trend(model, df, sentiment_score, feature_names)
+                                model, metrics, history = train_model(df)
+                                prediction, confidence = predict_trend(model, df, sentiment_score)
                                 
                                 # Display results
                                 with col2:
@@ -987,7 +968,10 @@ def main():
                                     st.write(f"{confidence:.2%}")
                                     
                                     # Additional metrics
-                                    st.write("Model Accuracy:", f"{accuracy:.2%}")
+                                    st.write("Model Performance:")
+                                    st.write(f"RMSE: {metrics['RMSE']:.2f}")
+                                    st.write(f"MAPE: {metrics['MAPE']:.2f}%")
+                                    st.write(f"Directional Accuracy: {metrics['Directional_Accuracy']:.2f}%")
                                     st.write("Sentiment Score:", f"{sentiment_score:.2f}")
                                     
                                     # Sentiment interpretation
@@ -1026,12 +1010,18 @@ def main():
                                         elif rsi_value < 30:
                                             st.write("Oversold condition - potential upward reversion")
                                     
-                                    # Feature importance
-                                    st.subheader("Feature Importance")
-                                    if not feature_importance.empty:
-                                        # Display top 5 features only
-                                        top_features = feature_importance.head(min(5, len(feature_importance)))
-                                        st.bar_chart(data=top_features.set_index('Feature')['Importance'])
+                                    # Training History
+                                    st.subheader("Model Training History")
+                                    if history:
+                                        # Plot training and validation loss
+                                        fig, ax = plt.subplots(figsize=(10, 4))
+                                        ax.plot(history.history['loss'], label='Training Loss')
+                                        ax.plot(history.history['val_loss'], label='Validation Loss')
+                                        ax.set_title('Model Loss Over Time')
+                                        ax.set_xlabel('Epoch')
+                                        ax.set_ylabel('Loss')
+                                        ax.legend()
+                                        st.pyplot(fig)
                             except ValueError as ve:
                                 st.error(f"Value Error in model: {str(ve)}")
                                 logger.error(f"Value Error in model: {str(ve)}\n{traceback.format_exc()}")
