@@ -516,7 +516,7 @@ def fetch_multiple_indian_stocks(stocks_list, start_date="2023-01-01", end_date=
                 session=yf_session
             )
             
-            if df.empty:
+            if df is None or df.empty:
                 logger.warning(f"No data found for {stock}")
                 continue
             
@@ -849,7 +849,7 @@ def main():
                                             progress=False,
                                             session=yf_session
                                         )
-                                        if not idx_data.empty:
+                                        if idx_data is not None and not idx_data.empty:
                                             idx_data.columns = pd.MultiIndex.from_product([[idx_ticker], idx_data.columns])
                                             indices_data_list.append(idx_data)
                                             logger.info(f"Successfully downloaded data for {idx_ticker}")
@@ -879,7 +879,7 @@ def main():
                             if indices_data_all is not None:
                                 for name, idx_ticker in indices.items():
                                     try:
-                                        if idx_ticker in indices_data_all.columns.levels[0]:
+                                        if idx_ticker in indices_data_all.columns.get_level_values(0):
                                             idx_data = indices_data_all[idx_ticker]
                                             if len(idx_data) >= 2:
                                                 latest_price = idx_data['Close'].iloc[-1]
@@ -1006,16 +1006,21 @@ def main():
                                     
                                     # Training History
                                     st.subheader("Model Training History")
-                                    if training_history:
+                                    if training_history and isinstance(training_history, dict):
                                         # Plot training and validation loss
                                         fig, ax = plt.subplots(figsize=(10, 4))
-                                        ax.plot(training_history['epochs'], training_history['train_loss'], label='Training Loss')
-                                        ax.plot(training_history['epochs'], training_history['val_loss'], label='Validation Loss')
-                                        ax.set_title('Model Loss Over Time')
-                                        ax.set_xlabel('Epoch')
-                                        ax.set_ylabel('Loss')
-                                        ax.legend()
-                                        st.pyplot(fig)
+                                        epochs = training_history.get('epochs', [])
+                                        train_loss = training_history.get('train_loss', [])
+                                        val_loss = training_history.get('val_loss', [])
+                                        
+                                        if epochs and train_loss and val_loss:
+                                            ax.plot(epochs, train_loss, label='Training Loss')
+                                            ax.plot(epochs, val_loss, label='Validation Loss')
+                                            ax.set_title('Model Loss Over Time')
+                                            ax.set_xlabel('Epoch')
+                                            ax.set_ylabel('Loss')
+                                            ax.legend()
+                                            st.pyplot(fig)
                             except ValueError as ve:
                                 st.error(f"Value Error in model: {str(ve)}")
                                 logger.error(f"Value Error in model: {str(ve)}\n{traceback.format_exc()}")

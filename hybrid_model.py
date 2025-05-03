@@ -7,7 +7,9 @@ import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
 import logging
+from typing import Optional
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -30,7 +32,7 @@ class HybridStockPredictor:
         self.learning_rate = learning_rate
         self.scaler = MinMaxScaler()
         self.linear_model = LinearRegression()
-        self.lstm_model = None
+        self.lstm_model: Optional[Sequential] = None
         self.feature_columns = None
         
         # Set random seeds for reproducibility
@@ -86,7 +88,7 @@ class HybridStockPredictor:
             input_shape (tuple): Shape of input data
             
         Returns:
-            tf.keras.Model: Compiled LSTM model
+            keras.Model: Compiled LSTM model
         """
         try:
             model = Sequential([
@@ -130,9 +132,11 @@ class HybridStockPredictor:
             
             # Build and train LSTM
             self.lstm_model = self.build_lstm_model(input_shape=(X_lstm.shape[1], X_lstm.shape[2]))
+            if self.lstm_model is None:
+                raise ValueError("LSTM model failed to initialize")
             
             # Add early stopping
-            early_stopping = tf.keras.callbacks.EarlyStopping(
+            early_stopping = EarlyStopping(
                 monitor='val_loss',
                 patience=5,
                 restore_best_weights=True
@@ -145,7 +149,7 @@ class HybridStockPredictor:
                 epochs=epochs,
                 batch_size=batch_size,
                 callbacks=[early_stopping],
-                verbose=1
+                verbose='auto'
             )
             
             # Make predictions on training data
@@ -181,6 +185,8 @@ class HybridStockPredictor:
         try:
             # Get predictions from both models
             linear_pred = self.linear_model.predict(X_linear)
+            if self.lstm_model is None:
+                raise ValueError("LSTM model has not been trained")
             lstm_pred = self.lstm_model.predict(X_lstm).flatten()
             
             # Combine predictions (simple average)
