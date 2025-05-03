@@ -1,0 +1,67 @@
+# Python virtual environments
+venv/
+.venv/
+env/
+*.venv/
+
+# Python compiled files
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+
+# Streamlit-specific
+.streamlit/
+*.streamlit
+
+# Dependency directories
+*.egg-info/
+dist/
+build/
+
+# Jupyter notebooks and checkpoints
+*.ipynb
+.ipynb_checkpoints/
+
+# TensorFlow-related
+*.h5
+*.hdf5
+*.ckpt
+*.tflite
+saved_model/
+tensorboard/
+
+# Data and cache files
+*.csv
+*.json
+*.parquet
+*.pickle
+*.pkl
+*.cache
+cache/
+*.log
+
+# Sensitive files (e.g., API keys, credentials)
+*.env
+.env
+secrets/
+*.key
+*.pem
+
+# Windows-specific files
+desktop.ini
+Thumbs.db
+*.lnk
+
+# IDE and editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Miscellaneous
+*.bak
+*.swp
+*.tmp
+temp/
+tmp/
