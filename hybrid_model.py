@@ -49,20 +49,8 @@ class HybridStockPredictor:
             tuple: (X_linear, X_lstm, y)
         """
         try:
-            # Handle MultiIndex if present
-            if isinstance(df.columns, pd.MultiIndex):
-                # Get the first level of the MultiIndex
-                df = df.xs(df.columns.levels[1][0], level=1, axis=1)
-                logger.info(f"After MultiIndex handling, shape: {df.shape}")
-                logger.info(f"After MultiIndex handling, columns: {df.columns}")
-            
             if feature_columns is None:
                 feature_columns = ['Close', 'Volume', 'SMA_20', 'RSI', 'BB_Position']
-            
-            # Ensure all required columns exist
-            missing_columns = [col for col in feature_columns if col not in df.columns]
-            if missing_columns:
-                raise ValueError(f"Missing required columns: {', '.join(missing_columns)}")
             
             self.feature_columns = feature_columns
             
@@ -132,6 +120,9 @@ class HybridStockPredictor:
             validation_split (float): Fraction of data to use for validation
             epochs (int): Number of training epochs
             batch_size (int): Batch size for training
+            
+        Returns:
+            tuple: (training_history, model_metrics)
         """
         try:
             # Train linear regression
@@ -147,6 +138,7 @@ class HybridStockPredictor:
                 restore_best_weights=True
             )
             
+            # Train LSTM model
             history = self.lstm_model.fit(
                 X_lstm, y,
                 validation_split=validation_split,
@@ -156,7 +148,20 @@ class HybridStockPredictor:
                 verbose=1
             )
             
-            return history
+            # Make predictions on training data
+            combined_pred, linear_pred, lstm_pred = self.predict(X_linear, X_lstm)
+            
+            # Evaluate model
+            metrics = self.evaluate(y, combined_pred)
+            
+            # Prepare training history for visualization
+            training_history = {
+                'epochs': range(1, len(history.history['loss']) + 1),
+                'train_loss': history.history['loss'],
+                'val_loss': history.history['val_loss']
+            }
+            
+            return training_history, metrics
             
         except Exception as e:
             logger.error(f"Error training models: {str(e)}")

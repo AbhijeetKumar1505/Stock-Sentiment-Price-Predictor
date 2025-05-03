@@ -1,6 +1,3 @@
-import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow warnings
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -20,8 +17,6 @@ import requests
 from requests_cache import CacheMixin, SQLiteCache
 from requests_ratelimiter import LimiterMixin, MemoryQueueBucket
 from pyrate_limiter import Duration, RequestRate, Limiter
-from tenacity import retry, stop_after_attempt, wait_exponential
-import tensorflow as tf
 from hybrid_model import HybridStockPredictor
 
 # Configure logging
@@ -33,31 +28,31 @@ class CachedLimiterSession(CacheMixin, LimiterMixin, requests.Session):
     pass
 
 # Define rate limits based on Yahoo Finance's typical limits
-# We'll use more conservative values to avoid rate limiting
+# We'll use conservative values to be safe
 yf_limiter = Limiter(
-    RequestRate(1, Duration.MINUTE * 2),  # Max 1 request per 2 minutes
-    RequestRate(10, Duration.HOUR),       # Max 10 requests per hour
-    RequestRate(50, Duration.DAY)         # Max 50 requests per day
+    RequestRate(60, Duration.MINUTE),  # Max 60 requests per minute
+    RequestRate(300, Duration.HOUR),   # Max 300 requests per hour
+    RequestRate(2000, Duration.DAY)    # Max 2000 requests per day
 )
 
-# Create caching directory - use a more persistent location for Streamlit cloud
-CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stock_predictor_cache")
+# Create caching directory
+CACHE_DIR = os.path.join(tempfile.gettempdir(), "stock_predictor_cache")
 try:
     os.makedirs(CACHE_DIR, exist_ok=True)
     logger.info(f"Cache directory created at: {CACHE_DIR}")
 except Exception as e:
     logger.error(f"Failed to create cache directory: {str(e)}")
-    CACHE_DIR = os.path.join(tempfile.gettempdir(), "stock_predictor_cache")
+    CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
     os.makedirs(CACHE_DIR, exist_ok=True)
     logger.info(f"Using fallback cache directory at: {CACHE_DIR}")
 
 CACHE_DB = os.path.join(CACHE_DIR, "yfinance_cache")
 
-# Create cached limiter session for Yahoo Finance with longer cache duration
+# Create cached limiter session for Yahoo Finance
 yf_session = CachedLimiterSession(
     limiter=yf_limiter,
     bucket_class=MemoryQueueBucket,
-    backend=SQLiteCache(CACHE_DB, expire_after=timedelta(days=30))  # Cache for 30 days
+    backend=SQLiteCache(CACHE_DB, expire_after=timedelta(days=1))
 )
 
 # Set a user agent that rotates to avoid detection
@@ -69,48 +64,6 @@ USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0'
 ]
 yf_session.headers['User-Agent'] = random.choice(USER_AGENTS)
-
-# Function to make a rate-limited request
-def make_rate_limited_request(func, *args, **kwargs):
-    max_retries = 3
-    retry_count = 0
-    
-    while retry_count < max_retries:
-        try:
-            # Add initial delay between requests
-            if retry_count == 0:
-                time.sleep(10)  # Increased initial delay to 10 seconds
-            
-            # Rotate user agent
-            yf_session.headers['User-Agent'] = random.choice(USER_AGENTS)
-            
-            # Try to get from cache first
-            cache_key = f"{func.__name__}_{args}_{kwargs}"
-            if hasattr(yf_session, 'cache') and yf_session.cache:
-                cached_response = yf_session.cache.get(cache_key)
-                if cached_response:
-                    logger.info("Using cached response")
-                    return cached_response
-            
-            # If not in cache, make the request
-            response = func(*args, **kwargs)
-            
-            # Cache the response
-            if hasattr(yf_session, 'cache') and yf_session.cache:
-                yf_session.cache.set(cache_key, response)
-            
-            return response
-            
-        except Exception as e:
-            if "rate" in str(e).lower() or "limit" in str(e).lower():
-                wait_time = min(120 * (2 ** retry_count), 1200)  # Start with 120s, max 20 minutes
-                logger.warning(f"Rate limit hit. Waiting {wait_time} seconds before retry {retry_count + 1}/{max_retries}")
-                time.sleep(wait_time)
-                retry_count += 1
-                continue
-            raise
-    
-    raise Exception(f"Failed after {max_retries} retries due to rate limiting")
 
 # Initialize sentiment analyzer
 sentiment_analyzer = SentimentIntensityAnalyzer()
@@ -190,13 +143,12 @@ def throttled_api_call(func, *args, **kwargs):
             time.sleep(random.uniform(1.0, 3.0))
         raise
 
-@st.cache_data(ttl=3600)
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=8, max=120))
-def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_retries=3, retry_delay=5):
+def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_retries=3, retry_delay=2):
     """Fetch stock data from Yahoo Finance using rate limit aware session."""
     # Format ticker with exchange suffix if Indian exchange is selected
     formatted_ticker = ticker
     if exchange and exchange in INDIAN_EXCHANGES:
+        # Remove any existing .NS suffix before adding it
         if formatted_ticker.endswith('.NS'):
             formatted_ticker = formatted_ticker[:-3]
         formatted_ticker = f"{formatted_ticker}{INDIAN_EXCHANGES[exchange]}"
@@ -208,7 +160,7 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
     if use_cache and os.path.exists(cache_file):
         try:
             file_time = datetime.fromtimestamp(os.path.getmtime(cache_file))
-            if datetime.now() - file_time < timedelta(days=7):
+            if datetime.now() - file_time < timedelta(days=1):
                 logger.info(f"Using cached data for {formatted_ticker}")
                 df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
                 return df
@@ -226,32 +178,56 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
         try:
             logger.info(f"Fetching data for {formatted_ticker} (attempt {retries+1}/{max_retries})")
             
-            # Use Ticker object instead of download for better rate limit handling
-            stock = yf.Ticker(formatted_ticker, session=yf_session)
-            
-            # Add delay between attempts
-            if retries > 0:
-                time.sleep(30 * (retries + 1))
-            
-            # Try to get historical data
-            df = stock.history(period=period, auto_adjust=True)
-            
-            if df is None or df.empty:
-                raise ValueError(f"No data found for ticker {formatted_ticker}")
-            
-            # Validate the data has required columns
-            required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
-            missing_columns = [col for col in required_columns if col not in df.columns]
-            if missing_columns:
-                raise ValueError(f"Missing required columns: {', '.join(missing_columns)}")
-            
-            logger.info(f"Data validation passed. Final shape: {df.shape}")
-            
-            # Save to cache if caching is enabled
-            if use_cache:
-                df.to_csv(cache_file, date_format='%Y-%m-%d')
-            
-            return df
+            # Use yf.download with proper parameters for Indian stocks
+            try:
+                df = yf.download(
+                    tickers=[formatted_ticker],  # Pass as a list
+                    period=period,
+                    auto_adjust=True,
+                    progress=False,
+                    session=yf_session
+                )
+                
+                logger.info(f"Downloaded data shape: {df.shape if df is not None else 'None'}")
+                logger.info(f"Downloaded data columns: {df.columns if df is not None else 'None'}")
+                
+                if df is None:
+                    raise ValueError(f"Failed to download data for {formatted_ticker}")
+                
+                if df.empty:
+                    raise ValueError(f"No data found for ticker {formatted_ticker}")
+                
+                # Handle MultiIndex if present
+                if isinstance(df.columns, pd.MultiIndex):
+                    logger.info(f"Found MultiIndex columns: {df.columns}")
+                    # Get the data for our specific ticker
+                    try:
+                        # Try to get the data using the ticker as a key
+                        df = df[formatted_ticker]
+                    except KeyError:
+                        # If that fails, try to get the first level of the MultiIndex
+                        df = df.xs(df.columns.levels[1][0], level=1, axis=1)
+                    logger.info(f"After MultiIndex handling, shape: {df.shape}")
+                    logger.info(f"After MultiIndex handling, columns: {df.columns}")
+                
+                # Validate the data has required columns
+                required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+                missing_columns = [col for col in required_columns if col not in df.columns]
+                if missing_columns:
+                    raise ValueError(f"Missing required columns: {', '.join(missing_columns)}")
+                
+                logger.info(f"Data validation passed. Final shape: {df.shape}")
+                logger.info(f"Data sample:\n{df.head()}")
+                
+                # Only save to cache if caching is enabled
+                if use_cache:
+                    df.to_csv(cache_file, date_format='%Y-%m-%d')
+                
+                return df
+                
+            except Exception as e:
+                logger.error(f"Error downloading data for {formatted_ticker}: {str(e)}")
+                raise ValueError(f"Failed to fetch data for {formatted_ticker}. Error: {str(e)}")
             
         except Exception as e:
             last_exception = e
@@ -260,7 +236,7 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
             
             # If it's not the last retry, wait before trying again
             if retries < max_retries:
-                time.sleep(retry_delay * (retries + 1))
+                time.sleep(retry_delay * (retries + 1))  # Exponential backoff
     
     # All retries failed, check for cached data as fallback
     logger.error(f"Error fetching data for {formatted_ticker} after {max_retries} attempts: {str(last_exception)}")
@@ -272,7 +248,8 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
         except Exception as e:
             logger.error(f"Error reading fallback cached data: {str(e)}")
     
-    raise Exception(f"Could not fetch data for {formatted_ticker}. Please try again later or enable caching.")
+    # If no cache or cache failed, raise a more user-friendly exception
+    raise Exception(f"Could not fetch data for {formatted_ticker}. Yahoo Finance API may be rate-limited or the stock may not exist. Please try again later or enable caching.")
 
 def fetch_index_data(index_ticker, period="7d", max_retries=3, retry_delay=2):
     """Fetch market index data with retry mechanism."""
@@ -718,7 +695,7 @@ def main():
                     if use_cache and os.path.exists(cache_file):
                         try:
                             file_time = datetime.fromtimestamp(os.path.getmtime(cache_file))
-                            if datetime.now() - file_time < timedelta(days=7):  # Use cached data for up to 7 days
+                            if datetime.now() - file_time < timedelta(days=1):
                                 logger.info(f"Using cached data for {formatted_ticker}")
                                 # Read the CSV file with proper date parsing
                                 df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
@@ -754,13 +731,7 @@ def main():
                             # Handle MultiIndex if present
                             if isinstance(df.columns, pd.MultiIndex):
                                 logger.info(f"Found MultiIndex columns: {df.columns}")
-                                # Get the data for our specific ticker
-                                try:
-                                    # Try to get the data using the ticker as a key
-                                    df = df[formatted_ticker]
-                                except KeyError:
-                                    # If that fails, try to get the first level of the MultiIndex
-                                    df = df.xs(df.columns.levels[1][0], level=1, axis=1)
+                                df = df[formatted_ticker]  # Get the data for our specific ticker
                                 logger.info(f"After MultiIndex handling, shape: {df.shape}")
                                 logger.info(f"After MultiIndex handling, columns: {df.columns}")
                             
@@ -973,7 +944,7 @@ def main():
                                     st.info("Try selecting a different time period or stock.")
                                     return
                                 
-                                model, metrics, history = train_model(df)
+                                model, metrics, training_history = train_model(df)
                                 prediction, confidence = predict_trend(model, df, sentiment_score)
                                 
                                 # Display results
@@ -1035,11 +1006,11 @@ def main():
                                     
                                     # Training History
                                     st.subheader("Model Training History")
-                                    if history:
+                                    if training_history:
                                         # Plot training and validation loss
                                         fig, ax = plt.subplots(figsize=(10, 4))
-                                        ax.plot(history.history['loss'], label='Training Loss')
-                                        ax.plot(history.history['val_loss'], label='Validation Loss')
+                                        ax.plot(training_history['epochs'], training_history['train_loss'], label='Training Loss')
+                                        ax.plot(training_history['epochs'], training_history['val_loss'], label='Validation Loss')
                                         ax.set_title('Model Loss Over Time')
                                         ax.set_xlabel('Epoch')
                                         ax.set_ylabel('Loss')
