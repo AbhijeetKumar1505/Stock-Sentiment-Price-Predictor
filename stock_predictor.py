@@ -1,3 +1,6 @@
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow warnings
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -17,6 +20,8 @@ import requests
 from requests_cache import CacheMixin, SQLiteCache
 from requests_ratelimiter import LimiterMixin, MemoryQueueBucket
 from pyrate_limiter import Duration, RequestRate, Limiter
+from tenacity import retry, stop_after_attempt, wait_exponential
+import tensorflow as tf
 from hybrid_model import HybridStockPredictor
 
 # Configure logging
@@ -30,9 +35,9 @@ class CachedLimiterSession(CacheMixin, LimiterMixin, requests.Session):
 # Define rate limits based on Yahoo Finance's typical limits
 # We'll use conservative values to be safe
 yf_limiter = Limiter(
-    RequestRate(60, Duration.MINUTE),  # Max 60 requests per minute
-    RequestRate(300, Duration.HOUR),   # Max 300 requests per hour
-    RequestRate(2000, Duration.DAY)    # Max 2000 requests per day
+    RequestRate(5, Duration.MINUTE),  # Max 5 requests per minute
+    RequestRate(60, Duration.HOUR),   # Max 60 requests per hour
+    RequestRate(500, Duration.DAY)    # Max 500 requests per day
 )
 
 # Create caching directory
@@ -143,6 +148,8 @@ def throttled_api_call(func, *args, **kwargs):
             time.sleep(random.uniform(1.0, 3.0))
         raise
 
+@st.cache_data(ttl=3600)
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=60))
 def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_retries=3, retry_delay=2):
     """Fetch stock data from Yahoo Finance using rate limit aware session."""
     # Format ticker with exchange suffix if Indian exchange is selected
