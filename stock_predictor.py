@@ -35,9 +35,9 @@ class CachedLimiterSession(CacheMixin, LimiterMixin, requests.Session):
 # Define rate limits based on Yahoo Finance's typical limits
 # We'll use more conservative values to avoid rate limiting
 yf_limiter = Limiter(
-    RequestRate(2, Duration.MINUTE),  # Max 2 requests per minute
-    RequestRate(30, Duration.HOUR),   # Max 30 requests per hour
-    RequestRate(200, Duration.DAY)    # Max 200 requests per day
+    RequestRate(1, Duration.MINUTE),  # Max 1 request per minute
+    RequestRate(20, Duration.HOUR),   # Max 20 requests per hour
+    RequestRate(100, Duration.DAY)    # Max 100 requests per day
 )
 
 # Create caching directory
@@ -69,6 +69,27 @@ USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0'
 ]
 yf_session.headers['User-Agent'] = random.choice(USER_AGENTS)
+
+# Function to make a rate-limited request
+def make_rate_limited_request(func, *args, **kwargs):
+    max_retries = 5
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            # Rotate user agent
+            yf_session.headers['User-Agent'] = random.choice(USER_AGENTS)
+            return func(*args, **kwargs)
+        except Exception as e:
+            if "rate" in str(e).lower() or "limit" in str(e).lower():
+                wait_time = min(30 * (2 ** retry_count), 300)  # Exponential backoff with max 5 minutes
+                logger.warning(f"Rate limit hit. Waiting {wait_time} seconds before retry {retry_count + 1}/{max_retries}")
+                time.sleep(wait_time)
+                retry_count += 1
+                continue
+            raise
+    
+    raise Exception(f"Failed after {max_retries} retries due to rate limiting")
 
 # Initialize sentiment analyzer
 sentiment_analyzer = SentimentIntensityAnalyzer()
@@ -185,63 +206,52 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
         try:
             logger.info(f"Fetching data for {formatted_ticker} (attempt {retries+1}/{max_retries})")
             
-            # Add a delay between retries
-            if retries > 0:
-                time.sleep(retry_delay * (retries + 1))
+            # Use the rate-limited request function
+            df = make_rate_limited_request(
+                yf.download,
+                tickers=[formatted_ticker],
+                period=period,
+                auto_adjust=True,
+                progress=False,
+                session=yf_session
+            )
             
-            # Use yf.download with proper parameters for Indian stocks
-            try:
-                df = yf.download(
-                    tickers=[formatted_ticker],  # Pass as a list
-                    period=period,
-                    auto_adjust=True,
-                    progress=False,
-                    session=yf_session
-                )
-                
-                logger.info(f"Downloaded data shape: {df.shape if df is not None else 'None'}")
-                logger.info(f"Downloaded data columns: {df.columns if df is not None else 'None'}")
-                
-                if df is None:
-                    raise ValueError(f"Failed to download data for {formatted_ticker}")
-                
-                if df.empty:
-                    raise ValueError(f"No data found for ticker {formatted_ticker}")
-                
-                # Handle MultiIndex if present
-                if isinstance(df.columns, pd.MultiIndex):
-                    logger.info(f"Found MultiIndex columns: {df.columns}")
-                    # Get the data for our specific ticker
-                    try:
-                        # Try to get the data using the ticker as a key
-                        df = df[formatted_ticker]
-                    except KeyError:
-                        # If that fails, try to get the first level of the MultiIndex
-                        df = df.xs(df.columns.levels[1][0], level=1, axis=1)
-                    logger.info(f"After MultiIndex handling, shape: {df.shape}")
-                    logger.info(f"After MultiIndex handling, columns: {df.columns}")
-                
-                # Validate the data has required columns
-                required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
-                missing_columns = [col for col in required_columns if col not in df.columns]
-                if missing_columns:
-                    raise ValueError(f"Missing required columns: {', '.join(missing_columns)}")
-                
-                logger.info(f"Data validation passed. Final shape: {df.shape}")
-                logger.info(f"Data sample:\n{df.head()}")
-                
-                # Only save to cache if caching is enabled
-                if use_cache:
-                    df.to_csv(cache_file, date_format='%Y-%m-%d')
-                
-                return df
-                
-            except Exception as e:
-                logger.error(f"Error downloading data for {formatted_ticker}: {str(e)}")
-                if "rate" in str(e).lower() or "limit" in str(e).lower():
-                    # If rate limited, wait longer before retrying
-                    time.sleep(30)  # Wait 30 seconds before retrying
-                raise ValueError(f"Failed to fetch data for {formatted_ticker}. Error: {str(e)}")
+            logger.info(f"Downloaded data shape: {df.shape if df is not None else 'None'}")
+            logger.info(f"Downloaded data columns: {df.columns if df is not None else 'None'}")
+            
+            if df is None:
+                raise ValueError(f"Failed to download data for {formatted_ticker}")
+            
+            if df.empty:
+                raise ValueError(f"No data found for ticker {formatted_ticker}")
+            
+            # Handle MultiIndex if present
+            if isinstance(df.columns, pd.MultiIndex):
+                logger.info(f"Found MultiIndex columns: {df.columns}")
+                # Get the data for our specific ticker
+                try:
+                    # Try to get the data using the ticker as a key
+                    df = df[formatted_ticker]
+                except KeyError:
+                    # If that fails, try to get the first level of the MultiIndex
+                    df = df.xs(df.columns.levels[1][0], level=1, axis=1)
+                logger.info(f"After MultiIndex handling, shape: {df.shape}")
+                logger.info(f"After MultiIndex handling, columns: {df.columns}")
+            
+            # Validate the data has required columns
+            required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            if missing_columns:
+                raise ValueError(f"Missing required columns: {', '.join(missing_columns)}")
+            
+            logger.info(f"Data validation passed. Final shape: {df.shape}")
+            logger.info(f"Data sample:\n{df.head()}")
+            
+            # Only save to cache if caching is enabled
+            if use_cache:
+                df.to_csv(cache_file, date_format='%Y-%m-%d')
+            
+            return df
             
         except Exception as e:
             last_exception = e
