@@ -197,7 +197,6 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
     # Format ticker with exchange suffix if Indian exchange is selected
     formatted_ticker = ticker
     if exchange and exchange in INDIAN_EXCHANGES:
-        # Remove any existing .NS suffix before adding it
         if formatted_ticker.endswith('.NS'):
             formatted_ticker = formatted_ticker[:-3]
         formatted_ticker = f"{formatted_ticker}{INDIAN_EXCHANGES[exchange]}"
@@ -209,7 +208,7 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
     if use_cache and os.path.exists(cache_file):
         try:
             file_time = datetime.fromtimestamp(os.path.getmtime(cache_file))
-            if datetime.now() - file_time < timedelta(days=7):  # Use cached data for up to 7 days
+            if datetime.now() - file_time < timedelta(days=7):
                 logger.info(f"Using cached data for {formatted_ticker}")
                 df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
                 return df
@@ -227,37 +226,18 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
         try:
             logger.info(f"Fetching data for {formatted_ticker} (attempt {retries+1}/{max_retries})")
             
-            # Use the rate-limited request function
-            df = make_rate_limited_request(
-                yf.download,
-                tickers=[formatted_ticker],
-                period=period,
-                auto_adjust=True,
-                progress=False,
-                session=yf_session
-            )
+            # Use Ticker object instead of download for better rate limit handling
+            stock = yf.Ticker(formatted_ticker, session=yf_session)
             
-            logger.info(f"Downloaded data shape: {df.shape if df is not None else 'None'}")
-            logger.info(f"Downloaded data columns: {df.columns if df is not None else 'None'}")
+            # Add delay between attempts
+            if retries > 0:
+                time.sleep(30 * (retries + 1))
             
-            if df is None:
-                raise ValueError(f"Failed to download data for {formatted_ticker}")
+            # Try to get historical data
+            df = stock.history(period=period, auto_adjust=True)
             
-            if df.empty:
+            if df is None or df.empty:
                 raise ValueError(f"No data found for ticker {formatted_ticker}")
-            
-            # Handle MultiIndex if present
-            if isinstance(df.columns, pd.MultiIndex):
-                logger.info(f"Found MultiIndex columns: {df.columns}")
-                # Get the data for our specific ticker
-                try:
-                    # Try to get the data using the ticker as a key
-                    df = df[formatted_ticker]
-                except KeyError:
-                    # If that fails, try to get the first level of the MultiIndex
-                    df = df.xs(df.columns.levels[1][0], level=1, axis=1)
-                logger.info(f"After MultiIndex handling, shape: {df.shape}")
-                logger.info(f"After MultiIndex handling, columns: {df.columns}")
             
             # Validate the data has required columns
             required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
@@ -266,9 +246,8 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
                 raise ValueError(f"Missing required columns: {', '.join(missing_columns)}")
             
             logger.info(f"Data validation passed. Final shape: {df.shape}")
-            logger.info(f"Data sample:\n{df.head()}")
             
-            # Only save to cache if caching is enabled
+            # Save to cache if caching is enabled
             if use_cache:
                 df.to_csv(cache_file, date_format='%Y-%m-%d')
             
@@ -281,7 +260,7 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
             
             # If it's not the last retry, wait before trying again
             if retries < max_retries:
-                time.sleep(retry_delay * (retries + 1))  # Exponential backoff
+                time.sleep(retry_delay * (retries + 1))
     
     # All retries failed, check for cached data as fallback
     logger.error(f"Error fetching data for {formatted_ticker} after {max_retries} attempts: {str(last_exception)}")
@@ -293,8 +272,7 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
         except Exception as e:
             logger.error(f"Error reading fallback cached data: {str(e)}")
     
-    # If no cache or cache failed, raise a more user-friendly exception
-    raise Exception(f"Could not fetch data for {formatted_ticker}. Yahoo Finance API may be rate-limited or the stock may not exist. Please try again later or enable caching.")
+    raise Exception(f"Could not fetch data for {formatted_ticker}. Please try again later or enable caching.")
 
 def fetch_index_data(index_ticker, period="7d", max_retries=3, retry_delay=2):
     """Fetch market index data with retry mechanism."""
