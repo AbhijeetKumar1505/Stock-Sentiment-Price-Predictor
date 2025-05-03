@@ -33,11 +33,11 @@ class CachedLimiterSession(CacheMixin, LimiterMixin, requests.Session):
     pass
 
 # Define rate limits based on Yahoo Finance's typical limits
-# We'll use conservative values to be safe
+# We'll use more conservative values to avoid rate limiting
 yf_limiter = Limiter(
-    RequestRate(5, Duration.MINUTE),  # Max 5 requests per minute
-    RequestRate(60, Duration.HOUR),   # Max 60 requests per hour
-    RequestRate(500, Duration.DAY)    # Max 500 requests per day
+    RequestRate(2, Duration.MINUTE),  # Max 2 requests per minute
+    RequestRate(30, Duration.HOUR),   # Max 30 requests per hour
+    RequestRate(200, Duration.DAY)    # Max 200 requests per day
 )
 
 # Create caching directory
@@ -53,11 +53,11 @@ except Exception as e:
 
 CACHE_DB = os.path.join(CACHE_DIR, "yfinance_cache")
 
-# Create cached limiter session for Yahoo Finance
+# Create cached limiter session for Yahoo Finance with longer cache duration
 yf_session = CachedLimiterSession(
     limiter=yf_limiter,
     bucket_class=MemoryQueueBucket,
-    backend=SQLiteCache(CACHE_DB, expire_after=timedelta(days=1))
+    backend=SQLiteCache(CACHE_DB, expire_after=timedelta(days=7))  # Cache for 7 days
 )
 
 # Set a user agent that rotates to avoid detection
@@ -149,8 +149,8 @@ def throttled_api_call(func, *args, **kwargs):
         raise
 
 @st.cache_data(ttl=3600)
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=60))
-def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_retries=3, retry_delay=2):
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=8, max=120))
+def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_retries=3, retry_delay=5):
     """Fetch stock data from Yahoo Finance using rate limit aware session."""
     # Format ticker with exchange suffix if Indian exchange is selected
     formatted_ticker = ticker
@@ -167,7 +167,7 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
     if use_cache and os.path.exists(cache_file):
         try:
             file_time = datetime.fromtimestamp(os.path.getmtime(cache_file))
-            if datetime.now() - file_time < timedelta(days=1):
+            if datetime.now() - file_time < timedelta(days=7):  # Use cached data for up to 7 days
                 logger.info(f"Using cached data for {formatted_ticker}")
                 df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
                 return df
@@ -184,6 +184,10 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
     while retries < max_retries:
         try:
             logger.info(f"Fetching data for {formatted_ticker} (attempt {retries+1}/{max_retries})")
+            
+            # Add a delay between retries
+            if retries > 0:
+                time.sleep(retry_delay * (retries + 1))
             
             # Use yf.download with proper parameters for Indian stocks
             try:
@@ -234,6 +238,9 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
                 
             except Exception as e:
                 logger.error(f"Error downloading data for {formatted_ticker}: {str(e)}")
+                if "rate" in str(e).lower() or "limit" in str(e).lower():
+                    # If rate limited, wait longer before retrying
+                    time.sleep(30)  # Wait 30 seconds before retrying
                 raise ValueError(f"Failed to fetch data for {formatted_ticker}. Error: {str(e)}")
             
         except Exception as e:
@@ -702,7 +709,7 @@ def main():
                     if use_cache and os.path.exists(cache_file):
                         try:
                             file_time = datetime.fromtimestamp(os.path.getmtime(cache_file))
-                            if datetime.now() - file_time < timedelta(days=1):
+                            if datetime.now() - file_time < timedelta(days=7):  # Use cached data for up to 7 days
                                 logger.info(f"Using cached data for {formatted_ticker}")
                                 # Read the CSV file with proper date parsing
                                 df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
