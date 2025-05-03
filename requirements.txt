@@ -8,8 +8,8 @@ vaderSentiment==3.3.2
 matplotlib==3.10.1
 requests==2.32.3
 requests-cache==1.2.1
-requests-ratelimiter==0.7.0
+requests-ratelimiter==1.0.0
 pyrate-limiter==3.7.0
-tensorflow==2.15.0
+tensorflow==2.19.0
 tenacity==8.2.3
 
