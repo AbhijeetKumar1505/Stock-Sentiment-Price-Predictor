@@ -143,7 +143,7 @@ def throttled_api_call(func, *args, **kwargs):
             time.sleep(random.uniform(1.0, 3.0))
         raise
 
-def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_retries=3, retry_delay=2):
+def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_retries=3, retry_delay=5):
     """Fetch stock data from Yahoo Finance using rate limit aware session."""
     # Format ticker with exchange suffix if Indian exchange is selected
     formatted_ticker = ticker
@@ -160,7 +160,8 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
     if use_cache and os.path.exists(cache_file):
         try:
             file_time = datetime.fromtimestamp(os.path.getmtime(cache_file))
-            if datetime.now() - file_time < timedelta(days=1):
+            # Increase cache duration to 7 days
+            if datetime.now() - file_time < timedelta(days=7):
                 logger.info(f"Using cached data for {formatted_ticker}")
                 df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
                 return df
@@ -183,6 +184,9 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
                 delay = retry_delay * (2 ** retries)  # Exponential backoff
                 logger.info(f"Waiting {delay} seconds before retry...")
                 time.sleep(delay)
+            else:
+                # Initial delay to avoid rate limits
+                time.sleep(10)
             
             # Use yf.download with proper parameters for Indian stocks
             try:
@@ -239,7 +243,7 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
             
             # If it's a rate limit error, wait longer
             if "rate limit" in str(e).lower() or "too many requests" in str(e).lower():
-                time.sleep(30)  # Wait 30 seconds for rate limit to reset
+                time.sleep(60)  # Wait 60 seconds for rate limit to reset
     
     # All retries failed, check for cached data as fallback
     logger.error(f"Error fetching data for {formatted_ticker} after {max_retries} attempts: {str(last_exception)}")
