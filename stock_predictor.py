@@ -207,15 +207,16 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
                 # Handle MultiIndex if present
                 if isinstance(df.columns, pd.MultiIndex):
                     logger.info(f"Found MultiIndex columns: {df.columns}")
-                    # Get the data for our specific ticker
                     try:
-                        # Try to get the data using the ticker as a key
-                        df = df[formatted_ticker]
-                    except KeyError:
-                        # If that fails, try to get the first level of the MultiIndex
-                        df = df.xs(df.columns.levels[1][0], level=1, axis=1)
-                    logger.info(f"After MultiIndex handling, shape: {df.shape}")
-                    logger.info(f"After MultiIndex handling, columns: {df.columns}")
+                        # Convert MultiIndex to regular columns
+                        df.columns = df.columns.get_level_values(0)
+                        
+                        logger.info(f"After MultiIndex handling, shape: {df.shape}")
+                        logger.info(f"After MultiIndex handling, columns: {df.columns}")
+                    except Exception as e:
+                        logger.error(f"Error handling MultiIndex: {str(e)}")
+                        # If all else fails, try to get the first column
+                        df = df.iloc[:, 0]
                 
                 # Validate the data has required columns
                 required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
@@ -508,49 +509,94 @@ def fetch_multiple_indian_stocks(stocks_list, start_date="2023-01-01", end_date=
     # Dictionary to store all stock data
     stock_data = {}
     
-    # Fetch data for each stock
+    # Fetch data for each stock with improved error handling
     for stock in formatted_stocks:
         try:
             logger.info(f"Fetching data for {stock}")
             
-            # Use yf.download with proper parameters
-            df = yf.download(
-                tickers=[stock],  # Pass as a list
-                start=start_date,
-                end=end_date,
-                auto_adjust=True,
-                progress=False,
-                session=yf_session
-            )
+            # Use yf.download with proper parameters and retry mechanism
+            max_retries = 3
+            retry_delay = 5
+            retries = 0
             
-            if df is None or df.empty:
-                logger.warning(f"No data found for {stock}")
-                continue
+            while retries < max_retries:
+                try:
+                    # Add delay between requests to avoid rate limiting
+                    if retries > 0:
+                        time.sleep(retry_delay * (2 ** retries))  # Exponential backoff
+                    
+                    df = yf.download(
+                        tickers=[stock],  # Pass as a list
+                        start=start_date,
+                        end=end_date,
+                        auto_adjust=True,
+                        progress=False,
+                        session=yf_session
+                    )
+                    
+                    if df is None or df.empty:
+                        logger.warning(f"No data found for {stock} on attempt {retries + 1}")
+                        retries += 1
+                        continue
+                    
+                    # Handle MultiIndex if present
+                    if isinstance(df.columns, pd.MultiIndex):
+                        try:
+                            if stock in df.columns.levels[1]:
+                                df = df[stock]
+                            else:
+                                df = df.xs(df.columns.levels[0][0], level=0, axis=1)
+                        except Exception as e:
+                            logger.error(f"Error handling MultiIndex for {stock}: {str(e)}")
+                            df = df.iloc[:, 0]
+                    
+                    # Validate required columns
+                    required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+                    if not all(col in df.columns for col in required_columns):
+                        logger.warning(f"Missing required columns for {stock}")
+                        retries += 1
+                        continue
+                    
+                    # Store the data
+                    stock_data[stock] = df
+                    
+                    # Export to CSV if requested
+                    if export_csv:
+                        csv_file = os.path.join(export_dir, f"{stock}_data.csv")
+                        df.to_csv(csv_file)
+                        logger.info(f"Exported data for {stock} to {csv_file}")
+                    
+                    # Calculate basic statistics
+                    logger.info(f"Data summary for {stock}:")
+                    logger.info(f"Date range: {df.index[0]} to {df.index[-1]}")
+                    logger.info(f"Number of trading days: {len(df)}")
+                    logger.info(f"Average daily volume: {df['Volume'].mean():,.0f}")
+                    
+                    # Calculate returns
+                    df['Daily_Return'] = df['Close'].pct_change()
+                    df['Cumulative_Return'] = (1 + df['Daily_Return']).cumprod() - 1
+                    
+                    logger.info(f"Total return: {df['Cumulative_Return'].iloc[-1]:.2%}")
+                    
+                    # Break the retry loop if successful
+                    break
+                    
+                except Exception as e:
+                    logger.error(f"Error fetching data for {stock} (attempt {retries + 1}): {str(e)}")
+                    retries += 1
+                    if retries == max_retries:
+                        logger.error(f"Failed to fetch data for {stock} after {max_retries} attempts")
             
-            # Store the data
-            stock_data[stock] = df
-            
-            # Export to CSV if requested
-            if export_csv:
-                csv_file = os.path.join(export_dir, f"{stock}_data.csv")
-                df.to_csv(csv_file)
-                logger.info(f"Exported data for {stock} to {csv_file}")
-            
-            # Calculate basic statistics
-            logger.info(f"Data summary for {stock}:")
-            logger.info(f"Date range: {df.index[0]} to {df.index[-1]}")
-            logger.info(f"Number of trading days: {len(df)}")
-            logger.info(f"Average daily volume: {df['Volume'].mean():,.0f}")
-            
-            # Calculate returns
-            df['Daily_Return'] = df['Close'].pct_change()
-            df['Cumulative_Return'] = (1 + df['Daily_Return']).cumprod() - 1
-            
-            logger.info(f"Total return: {df['Cumulative_Return'].iloc[-1]:.2%}")
+            # Add a delay between stocks to avoid rate limiting
+            time.sleep(2)
             
         except Exception as e:
-            logger.error(f"Error fetching data for {stock}: {str(e)}")
+            logger.error(f"Error processing {stock}: {str(e)}")
             continue
+    
+    if not stock_data:
+        logger.error("No stock data was successfully fetched")
+        return None
     
     return stock_data
 
@@ -563,7 +609,7 @@ def analyze_stock_data(stock_data):
     """
     if not stock_data:
         logger.error("No stock data available for analysis")
-        return
+        return None
     
     # Create a summary DataFrame
     summary_data = []
@@ -575,11 +621,17 @@ def analyze_stock_data(stock_data):
             avg_volume = df['Volume'].mean()
             volatility = df['Daily_Return'].std() * np.sqrt(252)  # Annualized volatility
             
+            # Calculate additional metrics
+            max_drawdown = (df['Close'] / df['Close'].cummax() - 1).min()
+            sharpe_ratio = (df['Daily_Return'].mean() * 252) / (df['Daily_Return'].std() * np.sqrt(252))
+            
             summary_data.append({
                 'Stock': stock,
                 'Total_Return': total_return,
                 'Avg_Volume': avg_volume,
                 'Volatility': volatility,
+                'Max_Drawdown': max_drawdown,
+                'Sharpe_Ratio': sharpe_ratio,
                 'Start_Price': df['Close'].iloc[0],
                 'End_Price': df['Close'].iloc[-1]
             })
@@ -738,9 +790,16 @@ def main():
                             # Handle MultiIndex if present
                             if isinstance(df.columns, pd.MultiIndex):
                                 logger.info(f"Found MultiIndex columns: {df.columns}")
-                                df = df[formatted_ticker]  # Get the data for our specific ticker
-                                logger.info(f"After MultiIndex handling, shape: {df.shape}")
-                                logger.info(f"After MultiIndex handling, columns: {df.columns}")
+                                try:
+                                    # Convert MultiIndex to regular columns
+                                    df.columns = df.columns.get_level_values(0)
+                                    
+                                    logger.info(f"After MultiIndex handling, shape: {df.shape}")
+                                    logger.info(f"After MultiIndex handling, columns: {df.columns}")
+                                except Exception as e:
+                                    logger.error(f"Error handling MultiIndex: {str(e)}")
+                                    # If all else fails, try to get the first column
+                                    df = df.iloc[:, 0]
                             
                             # Validate the data has required columns
                             required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
