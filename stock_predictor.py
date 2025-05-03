@@ -178,6 +178,12 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
         try:
             logger.info(f"Fetching data for {formatted_ticker} (attempt {retries+1}/{max_retries})")
             
+            # Add exponential backoff delay between retries
+            if retries > 0:
+                delay = retry_delay * (2 ** retries)  # Exponential backoff
+                logger.info(f"Waiting {delay} seconds before retry...")
+                time.sleep(delay)
+            
             # Use yf.download with proper parameters for Indian stocks
             try:
                 df = yf.download(
@@ -191,10 +197,7 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
                 logger.info(f"Downloaded data shape: {df.shape if df is not None else 'None'}")
                 logger.info(f"Downloaded data columns: {df.columns if df is not None else 'None'}")
                 
-                if df is None:
-                    raise ValueError(f"Failed to download data for {formatted_ticker}")
-                
-                if df.empty:
+                if df is None or df.empty:
                     raise ValueError(f"No data found for ticker {formatted_ticker}")
                 
                 # Handle MultiIndex if present
@@ -234,9 +237,9 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
             logger.warning(f"Attempt {retries+1}/{max_retries} failed: {str(e)}")
             retries += 1
             
-            # If it's not the last retry, wait before trying again
-            if retries < max_retries:
-                time.sleep(retry_delay * (retries + 1))  # Exponential backoff
+            # If it's a rate limit error, wait longer
+            if "rate limit" in str(e).lower() or "too many requests" in str(e).lower():
+                time.sleep(30)  # Wait 30 seconds for rate limit to reset
     
     # All retries failed, check for cached data as fallback
     logger.error(f"Error fetching data for {formatted_ticker} after {max_retries} attempts: {str(last_exception)}")
