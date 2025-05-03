@@ -35,9 +35,9 @@ class CachedLimiterSession(CacheMixin, LimiterMixin, requests.Session):
 # Define rate limits based on Yahoo Finance's typical limits
 # We'll use more conservative values to avoid rate limiting
 yf_limiter = Limiter(
-    RequestRate(1, Duration.MINUTE),  # Max 1 request per minute
-    RequestRate(20, Duration.HOUR),   # Max 20 requests per hour
-    RequestRate(100, Duration.DAY)    # Max 100 requests per day
+    RequestRate(1, Duration.MINUTE * 2),  # Max 1 request per 2 minutes
+    RequestRate(10, Duration.HOUR),       # Max 10 requests per hour
+    RequestRate(50, Duration.DAY)         # Max 50 requests per day
 )
 
 # Create caching directory
@@ -72,17 +72,21 @@ yf_session.headers['User-Agent'] = random.choice(USER_AGENTS)
 
 # Function to make a rate-limited request
 def make_rate_limited_request(func, *args, **kwargs):
-    max_retries = 5
+    max_retries = 3  # Reduced from 5 to 3
     retry_count = 0
     
     while retry_count < max_retries:
         try:
+            # Add initial delay between requests
+            if retry_count == 0:
+                time.sleep(5)  # Initial 5 second delay
+            
             # Rotate user agent
             yf_session.headers['User-Agent'] = random.choice(USER_AGENTS)
             return func(*args, **kwargs)
         except Exception as e:
             if "rate" in str(e).lower() or "limit" in str(e).lower():
-                wait_time = min(30 * (2 ** retry_count), 300)  # Exponential backoff with max 5 minutes
+                wait_time = min(60 * (2 ** retry_count), 600)  # Start with 60s, max 10 minutes
                 logger.warning(f"Rate limit hit. Waiting {wait_time} seconds before retry {retry_count + 1}/{max_retries}")
                 time.sleep(wait_time)
                 retry_count += 1
