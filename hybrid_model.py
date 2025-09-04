@@ -3,17 +3,50 @@ import pandas as pd
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 import logging
 from typing import Optional
+from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+class LSTMModel(nn.Module):
+    """PyTorch LSTM model for stock prediction."""
+    
+    def __init__(self, input_size, hidden_size, num_layers, dropout_rate=0.2):
+        super(LSTMModel, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout_rate if num_layers > 1 else 0,
+            batch_first=True
+        )
+        
+        self.dropout = nn.Dropout(dropout_rate)
+        self.fc = nn.Linear(hidden_size, 1)
+    
+    def forward(self, x):
+        # Initialize hidden state with zeros
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        
+        # Forward propagate LSTM
+        out, _ = self.lstm(x, (h0, c0))
+        
+        # Decode the hidden state of the last time step
+        out = self.dropout(out[:, -1, :])
+        out = self.fc(out)
+        return out
 
 class HybridStockPredictor:
     def __init__(self, sequence_length=30, lstm_units=50, dropout_rate=0.2, learning_rate=0.001):
@@ -32,12 +65,17 @@ class HybridStockPredictor:
         self.learning_rate = learning_rate
         self.scaler = MinMaxScaler()
         self.linear_model = LinearRegression()
-        self.lstm_model: Optional[Sequential] = None
+        self.svr_model = SVR(kernel='rbf', C=100, gamma=0.1, epsilon=0.1)
+        self.rf_model = RandomForestRegressor(n_estimators=100, random_state=42)
+        self.lstm_model: Optional[LSTMModel] = None
         self.feature_columns = None
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # Set random seeds for reproducibility
         np.random.seed(42)
-        tf.random.set_seed(42)
+        torch.manual_seed(42)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(42)
     
     def prepare_data(self, df, feature_columns=None):
         """
@@ -80,32 +118,25 @@ class HybridStockPredictor:
             logger.error(f"Error preparing data: {str(e)}")
             raise
     
-    def build_lstm_model(self, input_shape):
+    def build_lstm_model(self, input_size):
         """
-        Build and compile the LSTM model.
+        Build the PyTorch LSTM model.
         
         Args:
-            input_shape (tuple): Shape of input data
+            input_size (int): Number of input features
             
         Returns:
-            keras.Model: Compiled LSTM model
+            LSTMModel: PyTorch LSTM model
         """
         try:
-            model = Sequential([
-                LSTM(self.lstm_units, input_shape=input_shape, return_sequences=True),
-                Dropout(self.dropout_rate),
-                LSTM(self.lstm_units),
-                Dropout(self.dropout_rate),
-                Dense(1)
-            ])
-            
-            model.compile(
-                optimizer=Adam(learning_rate=self.learning_rate),
-                loss='mean_squared_error',
-                metrics=['mae']
+            model = LSTMModel(
+                input_size=input_size,
+                hidden_size=self.lstm_units,
+                num_layers=2,
+                dropout_rate=self.dropout_rate
             )
             
-            return model
+            return model.to(self.device)
             
         except Exception as e:
             logger.error(f"Error building LSTM model: {str(e)}")
@@ -129,40 +160,86 @@ class HybridStockPredictor:
         try:
             # Train linear regression
             self.linear_model.fit(X_linear, y)
+            # Train SVR
+            self.svr_model.fit(X_linear, y)
+            # Train Random Forest
+            self.rf_model.fit(X_linear, y)
             
-            # Build and train LSTM
-            self.lstm_model = self.build_lstm_model(input_shape=(X_lstm.shape[1], X_lstm.shape[2]))
+            # Build LSTM model
+            self.lstm_model = self.build_lstm_model(input_size=X_lstm.shape[2])
             if self.lstm_model is None:
                 raise ValueError("LSTM model failed to initialize")
             
-            # Add early stopping
-            early_stopping = EarlyStopping(
-                monitor='val_loss',
-                patience=5,
-                restore_best_weights=True
-            )
+            # Prepare PyTorch tensors
+            X_lstm_tensor = torch.FloatTensor(X_lstm).to(self.device)
+            y_tensor = torch.FloatTensor(y).to(self.device)
             
-            # Train LSTM model
-            history = self.lstm_model.fit(
-                X_lstm, y,
-                validation_split=validation_split,
-                epochs=epochs,
-                batch_size=batch_size,
-                callbacks=[early_stopping],
-                verbose='auto'
-            )
+            # Split data for validation
+            split_idx = int(len(X_lstm) * (1 - validation_split))
+            X_train = X_lstm_tensor[:split_idx]
+            y_train = y_tensor[:split_idx]
+            X_val = X_lstm_tensor[split_idx:]
+            y_val = y_tensor[split_idx:]
+            
+            # Create data loaders
+            train_dataset = TensorDataset(X_train, y_train)
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+            
+            val_dataset = TensorDataset(X_val, y_val)
+            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+            
+            # Setup optimizer and loss function
+            optimizer = optim.Adam(self.lstm_model.parameters(), lr=self.learning_rate)
+            criterion = nn.MSELoss()
+            
+            # Training history
+            train_losses = []
+            val_losses = []
+            
+            # Training loop
+            for epoch in range(epochs):
+                # Training phase
+                self.lstm_model.train()
+                train_loss = 0.0
+                for batch_X, batch_y in train_loader:
+                    optimizer.zero_grad()
+                    outputs = self.lstm_model(batch_X).squeeze()
+                    loss = criterion(outputs, batch_y)
+                    loss.backward()
+                    optimizer.step()
+                    train_loss += loss.item()
+                
+                # Validation phase
+                self.lstm_model.eval()
+                val_loss = 0.0
+                with torch.no_grad():
+                    for batch_X, batch_y in val_loader:
+                        outputs = self.lstm_model(batch_X).squeeze()
+                        loss = criterion(outputs, batch_y)
+                        val_loss += loss.item()
+                
+                train_losses.append(train_loss / len(train_loader))
+                val_losses.append(val_loss / len(val_loader))
+                
+                # Early stopping
+                if epoch > 5 and val_losses[-1] > val_losses[-2]:
+                    logger.info(f"Early stopping at epoch {epoch}")
+                    break
+                
+                if epoch % 10 == 0:
+                    logger.info(f"Epoch {epoch}: Train Loss: {train_losses[-1]:.4f}, Val Loss: {val_losses[-1]:.4f}")
             
             # Make predictions on training data
-            combined_pred, linear_pred, lstm_pred = self.predict(X_linear, X_lstm)
+            combined_pred, linear_pred, lstm_pred, svr_pred, rf_pred = self.predict(X_linear, X_lstm)
             
             # Evaluate model
             metrics = self.evaluate(y, combined_pred)
             
             # Prepare training history for visualization
             training_history = {
-                'epochs': range(1, len(history.history['loss']) + 1),
-                'train_loss': history.history['loss'],
-                'val_loss': history.history['val_loss']
+                'epochs': range(1, len(train_losses) + 1),
+                'train_loss': train_losses,
+                'val_loss': val_losses
             }
             
             return training_history, metrics
@@ -183,16 +260,26 @@ class HybridStockPredictor:
             tuple: (combined_predictions, linear_predictions, lstm_predictions)
         """
         try:
-            # Get predictions from both models
+            # Get predictions from linear regression
             linear_pred = self.linear_model.predict(X_linear)
+            # Get predictions from SVR
+            svr_pred = self.svr_model.predict(X_linear)
+            # Get predictions from Random Forest
+            rf_pred = self.rf_model.predict(X_linear)
+            
+            # Get predictions from LSTM
             if self.lstm_model is None:
                 raise ValueError("LSTM model has not been trained")
-            lstm_pred = self.lstm_model.predict(X_lstm).flatten()
             
-            # Combine predictions (simple average)
-            combined_pred = (linear_pred + lstm_pred) / 2
+            self.lstm_model.eval()
+            with torch.no_grad():
+                X_lstm_tensor = torch.FloatTensor(X_lstm).to(self.device)
+                lstm_pred = self.lstm_model(X_lstm_tensor).cpu().numpy().flatten()
             
-            return combined_pred, linear_pred, lstm_pred
+            # Combine predictions (average of all four models)
+            combined_pred = (linear_pred + lstm_pred + svr_pred + rf_pred) / 4
+            
+            return combined_pred, linear_pred, lstm_pred, svr_pred, rf_pred
             
         except Exception as e:
             logger.error(f"Error making predictions: {str(e)}")

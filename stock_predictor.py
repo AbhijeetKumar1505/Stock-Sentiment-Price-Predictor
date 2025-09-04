@@ -14,26 +14,17 @@ import tempfile
 import time
 import random
 import requests
-from requests_cache import CacheMixin, SQLiteCache
-from requests_ratelimiter import LimiterMixin, MemoryQueueBucket
 from pyrate_limiter import Duration, RequestRate, Limiter
 from hybrid_model import HybridStockPredictor
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tf_explain.core.grad_cam import GradCAM
+from sklearn.preprocessing import MinMaxScaler
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# Create a session that respects rate limits and uses caching
-class CachedLimiterSession(CacheMixin, LimiterMixin, requests.Session):
-    pass
-
-# Define rate limits based on Yahoo Finance's typical limits
-# We'll use conservative values to be safe
-yf_limiter = Limiter(
-    RequestRate(60, Duration.MINUTE),  # Max 60 requests per minute
-    RequestRate(300, Duration.HOUR),   # Max 300 requests per hour
-    RequestRate(2000, Duration.DAY)    # Max 2000 requests per day
-)
 
 # Create caching directory
 CACHE_DIR = os.path.join(tempfile.gettempdir(), "stock_predictor_cache")
@@ -48,14 +39,7 @@ except Exception as e:
 
 CACHE_DB = os.path.join(CACHE_DIR, "yfinance_cache")
 
-# Create cached limiter session for Yahoo Finance
-yf_session = CachedLimiterSession(
-    limiter=yf_limiter,
-    bucket_class=MemoryQueueBucket,
-    backend=SQLiteCache(CACHE_DB, expire_after=timedelta(days=1))
-)
-
-# Set a user agent that rotates to avoid detection
+# Set a user agent that rotates to avoid detection (not used for yfinance anymore)
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36',
@@ -63,7 +47,7 @@ USER_AGENTS = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0'
 ]
-yf_session.headers['User-Agent'] = random.choice(USER_AGENTS)
+# yf_session.headers['User-Agent'] = random.choice(USER_AGENTS)  # Removed
 
 # Initialize sentiment analyzer
 sentiment_analyzer = SentimentIntensityAnalyzer()
@@ -194,8 +178,7 @@ def fetch_stock_data(ticker, period="1y", exchange=None, use_cache=True, max_ret
                     tickers=[formatted_ticker],  # Pass as a list
                     period=period,
                     auto_adjust=True,
-                    progress=False,
-                    session=yf_session
+                    progress=False
                 )
                 
                 logger.info(f"Downloaded data shape: {df.shape if df is not None else 'None'}")
@@ -267,7 +250,7 @@ def fetch_index_data(index_ticker, period="7d", max_retries=3, retry_delay=2):
     while retries < max_retries:
         try:
             logger.info(f"Fetching index data for {index_ticker} (attempt {retries+1}/{max_retries})")
-            index = yf.Ticker(index_ticker, session=yf_session)
+            index = yf.Ticker(index_ticker)
             df = index.history(period=period)
             
             # Return None if no data or not enough data points
@@ -418,12 +401,13 @@ def train_model(df):
         history = model.train(X_linear, X_lstm, y)
         
         # Make predictions on training data
-        combined_pred, linear_pred, lstm_pred = model.predict(X_linear, X_lstm)
+        combined_pred, linear_pred, lstm_pred, svr_pred, rf_pred = model.predict(X_linear, X_lstm)
         
         # Evaluate model
         metrics = model.evaluate(y, combined_pred)
         
-        return model, metrics, history
+        # Return all predictions for further analysis
+        return model, metrics, history, (combined_pred, linear_pred, lstm_pred, svr_pred, rf_pred)
         
     except Exception as e:
         logger.error(f"Error in model training: {str(e)}")
@@ -436,17 +420,24 @@ def predict_trend(model, df, sentiment_score):
         X_linear, X_lstm, _ = model.prepare_data(df)
         
         # Get predictions
-        combined_pred, linear_pred, lstm_pred = model.predict(X_linear[-1:], X_lstm[-1:])
+        combined_pred, linear_pred, lstm_pred, svr_pred, rf_pred = model.predict(X_linear[-1:], X_lstm[-1:])
         
         # Calculate confidence based on model agreement and sentiment
-        model_agreement = 1 - abs(linear_pred[0] - lstm_pred[0]) / (abs(linear_pred[0]) + abs(lstm_pred[0]))
+        preds = np.array([linear_pred[0], lstm_pred[0], svr_pred[0], rf_pred[0]])
+        model_agreement = 1 - np.std(preds) / (np.abs(preds).mean() + 1e-8)
         confidence = 0.7 * model_agreement + 0.3 * (sentiment_score + 1) / 2
         
         # Determine trend (1 for up, 0 for down)
         prediction = 1 if combined_pred[0] > df['Close'].iloc[-1] else 0
         
-        return prediction, confidence
-        
+        # Return all model predictions for display
+        return prediction, confidence, {
+            'combined': combined_pred[0],
+            'linear': linear_pred[0],
+            'lstm': lstm_pred[0],
+            'svr': svr_pred[0],
+            'rf': rf_pred[0]
+        }
     except Exception as e:
         logger.error(f"Error making prediction: {str(e)}")
         raise
@@ -530,8 +521,7 @@ def fetch_multiple_indian_stocks(stocks_list, start_date="2023-01-01", end_date=
                         start=start_date,
                         end=end_date,
                         auto_adjust=True,
-                        progress=False,
-                        session=yf_session
+                        progress=False
                     )
                     
                     if df is None or df.empty:
@@ -650,12 +640,89 @@ def analyze_stock_data(stock_data):
     
     return summary_df
 
+class KerasLSTMModel:
+    def __init__(self, sequence_length=30, lstm_units=50, dropout_rate=0.2, learning_rate=0.001):
+        self.sequence_length = sequence_length
+        self.lstm_units = lstm_units
+        self.dropout_rate = dropout_rate
+        self.learning_rate = learning_rate
+        self.model = None
+        self.scaler = MinMaxScaler()
+        self.feature_columns = ['Close', 'Volume', 'SMA_20', 'RSI', 'BB_Position']
+
+    def prepare_data(self, df):
+        df = df.copy()
+        df['Target'] = df['Close'].shift(-1)
+        df = df.dropna()
+        scaled_features = self.scaler.fit_transform(df[self.feature_columns])
+        X = []
+        for i in range(len(scaled_features) - self.sequence_length):
+            X.append(scaled_features[i:(i + self.sequence_length)])
+        X = np.array(X)
+        y = df['Target'].values[self.sequence_length:]
+        return X, y
+
+    def build_model(self, input_shape):
+        model = keras.Sequential([
+            layers.LSTM(self.lstm_units, input_shape=input_shape, dropout=self.dropout_rate, return_sequences=False),
+            layers.Dense(1)
+        ])
+        model.compile(optimizer=keras.optimizers.Adam(learning_rate=self.learning_rate), loss='mse')
+        return model
+
+    def train(self, df, epochs=50, batch_size=32, validation_split=0.2):
+        X, y = self.prepare_data(df)
+        self.model = self.build_model((X.shape[1], X.shape[2]))
+        history = self.model.fit(X, y, epochs=epochs, batch_size=batch_size, validation_split=validation_split, verbose=0)
+        return history
+
+    def predict(self, df):
+        X, _ = self.prepare_data(df)
+        return self.model.predict(X)
+
+def compute_lstm_saliency_map(keras_model, df):
+    # Prepare the last input sequence
+    X, _ = keras_model.prepare_data(df)
+    if len(X) == 0:
+        return None, None
+    last_input = X[-1:]
+    input_tensor = tf.convert_to_tensor(last_input)
+    with tf.GradientTape() as tape:
+        tape.watch(input_tensor)
+        pred = keras_model.model(input_tensor)
+    grads = tape.gradient(pred, input_tensor)
+    # Aggregate gradients (absolute value) over features
+    saliency = tf.reduce_mean(tf.abs(grads), axis=2).numpy()[0]  # shape: (sequence_length,)
+    # For heatmap, also return the input sequence for context
+    return saliency, last_input[0]
+
+# Helper functions for Streamlit integration
+
+def train_keras_lstm_model(df, epochs=50, batch_size=32):
+    keras_model = KerasLSTMModel()
+    history = keras_model.train(df, epochs=epochs, batch_size=batch_size)
+    return keras_model, history
+
+def predict_with_keras_lstm(keras_model, df):
+    preds = keras_model.predict(df)
+    return preds
+
 def main():
     try:
         st.set_page_config(page_title="Stock Price Predictor", layout="wide")
         
         st.title("📈 Stock Price Predictor")
+        st.markdown("""
+            <style>
+            .big-metric {font-size: 2.2em; font-weight: bold;}
+            .metric-up {color: #27ae60;}
+            .metric-down {color: #c0392b;}
+            .section-header {font-size: 1.3em; font-weight: 600; margin-top: 1.5em;}
+            .divider {border-top: 1px solid #eee; margin: 1em 0;}
+            </style>
+        """, unsafe_allow_html=True)
         st.write("Predict whether a stock's price will rise or fall based on historical data and sentiment analysis.")
+        st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
         
         # Sidebar for user input
         st.sidebar.header("Input Parameters")
@@ -733,7 +800,7 @@ def main():
         st.sidebar.warning("⚠️ Yahoo Finance enforces rate limits. The app now includes automatic rate limiting and caching to avoid disruptions.")
         
         # Main content area
-        col1, col2 = st.columns([2, 1])
+        col1, col2 = st.columns([2, 1], gap="large")
         
         try:
             with st.spinner("Fetching stock data..."):
@@ -774,8 +841,7 @@ def main():
                                 tickers=[formatted_ticker],  # Pass as a list
                                 period=period,
                                 auto_adjust=True,
-                                progress=False,
-                                session=yf_session
+                                progress=False
                             )
                             
                             logger.info(f"Downloaded data shape: {df.shape if df is not None else 'None'}")
@@ -832,7 +898,7 @@ def main():
                 
                 try:
                     # Display stock info
-                    stock = yf.Ticker(formatted_ticker, session=yf_session)
+                    stock = yf.Ticker(formatted_ticker)
                     try:
                         info = stock.info
                     except:
@@ -888,9 +954,8 @@ def main():
                             # Use yf.download for batch downloading of indices
                             indices_tickers = list(indices.values())
                             indices_data_all = None
-                            
-                            # Try to load indices from cache or download
                             indices_cache_file = os.path.join(CACHE_DIR, "market_indices_data.csv")
+                            # Try to load indices from cache or download
                             if use_cache and os.path.exists(indices_cache_file):
                                 file_time = datetime.fromtimestamp(os.path.getmtime(indices_cache_file))
                                 if datetime.now() - file_time < timedelta(hours=6):  # 6 hours for indices
@@ -901,48 +966,68 @@ def main():
                                     except Exception as e:
                                         logger.error(f"Error reading indices cache: {str(e)}")
                                         indices_data_all = None
-                            
                             if indices_data_all is None:
-                                # Download each index separately and combine
-                                indices_data_list = []
-                                for idx_ticker in indices_tickers:
-                                    try:
-                                        logger.info(f"Downloading data for index {idx_ticker}")
-                                        idx_data = yf.download(
-                                            tickers=[idx_ticker],
-                                            period="2d",
-                                            auto_adjust=True,
-                                            progress=False,
-                                            session=yf_session
-                                        )
-                                        if idx_data is not None and not idx_data.empty:
-                                            idx_data.columns = pd.MultiIndex.from_product([[idx_ticker], idx_data.columns])
-                                            indices_data_list.append(idx_data)
-                                            logger.info(f"Successfully downloaded data for {idx_ticker}")
-                                        else:
-                                            logger.warning(f"No data found for index {idx_ticker}")
-                                    except Exception as e:
-                                        logger.error(f"Error downloading index {idx_ticker}: {str(e)}")
-                                        continue
-                                
-                                if indices_data_list:
-                                    try:
-                                        indices_data_all = pd.concat(indices_data_list, axis=1)
-                                        logger.info(f"Combined indices data shape: {indices_data_all.shape}")
-                                        
-                                        if use_cache:
+                                # Try batch download first
+                                try:
+                                    logger.info(f"Batch downloading indices: {indices_tickers}")
+                                    batch_data = yf.download(
+                                        tickers=indices_tickers,
+                                        period="2d",
+                                        auto_adjust=True,
+                                        group_by='ticker',
+                                        progress=False
+                                    )
+                                    # If batch_data is a MultiIndex DataFrame, reformat
+                                    if isinstance(batch_data.columns, pd.MultiIndex):
+                                        indices_data_all = batch_data
+                                    else:
+                                        # If only one index, wrap in MultiIndex
+                                        indices_data_all = pd.concat({indices_tickers[0]: batch_data}, axis=1)
+                                    logger.info(f"Batch download successful. Shape: {indices_data_all.shape}")
+                                    # Save to cache if valid
+                                    if use_cache and indices_data_all is not None and not indices_data_all.empty:
+                                        indices_data_all.to_csv(indices_cache_file)
+                                        logger.info(f"Saved indices data to cache: {indices_cache_file}")
+                                except Exception as e:
+                                    logger.error(f"Batch download failed: {str(e)}")
+                                    indices_data_all = None
+                                # If batch fails, try individual download with retry
+                                if indices_data_all is None:
+                                    indices_data_list = []
+                                    for idx_ticker in indices_tickers:
+                                        for attempt in range(3):
                                             try:
+                                                logger.info(f"Downloading data for index {idx_ticker}, attempt {attempt+1}")
+                                                idx_data = yf.download(
+                                                    tickers=[idx_ticker],
+                                                    period="2d",
+                                                    auto_adjust=True,
+                                                    progress=False
+                                                )
+                                                if idx_data is not None and not idx_data.empty:
+                                                    idx_data.columns = pd.MultiIndex.from_product([[idx_ticker], idx_data.columns])
+                                                    indices_data_list.append(idx_data)
+                                                    logger.info(f"Successfully downloaded data for {idx_ticker}")
+                                                    break
+                                                else:
+                                                    logger.warning(f"No data found for index {idx_ticker} on attempt {attempt+1}")
+                                            except Exception as e:
+                                                logger.error(f"Error downloading index {idx_ticker} on attempt {attempt+1}: {str(e)}")
+                                                time.sleep(2)
+                                                continue
+                                    if indices_data_list:
+                                        try:
+                                            indices_data_all = pd.concat(indices_data_list, axis=1)
+                                            logger.info(f"Combined indices data shape: {indices_data_all.shape}")
+                                            if use_cache:
                                                 indices_data_all.to_csv(indices_cache_file)
                                                 logger.info(f"Saved indices data to cache: {indices_cache_file}")
-                                            except Exception as e:
-                                                logger.error(f"Error saving indices cache: {str(e)}")
-                                    except Exception as e:
-                                        logger.error(f"Error combining indices data: {str(e)}")
-                                        indices_data_all = None
-                            
+                                        except Exception as e:
+                                            logger.error(f"Error combining indices data: {str(e)}")
+                                            indices_data_all = None
                             # Display indices data
                             indices_display = []
-                            if indices_data_all is not None:
+                            if indices_data_all is not None and not indices_data_all.empty:
                                 for name, idx_ticker in indices.items():
                                     try:
                                         if idx_ticker in indices_data_all.columns.get_level_values(0):
@@ -962,15 +1047,14 @@ def main():
                                     except Exception as e:
                                         logger.error(f"Error processing index {name}: {str(e)}")
                                         continue
-                            
                             # Create a small dataframe for the indices
                             if indices_display:
                                 st.write("Latest market index values:")
                                 for idx in indices_display:
                                     st.write(f"{idx['name']}: {idx['price']:.2f} ({idx['change']:.2f}%)")
                             else:
-                                st.warning("Market index data currently unavailable. Please try again later.")
-                                logger.warning("No valid indices data to display")
+                                st.warning("Market index data currently unavailable. Please try again later. (Check your internet connection or Yahoo Finance availability.)")
+                                logger.warning(f"No valid indices data to display. Last attempted tickers: {indices}")
                         except Exception as e:
                             logger.error(f"Error showing indices: {str(e)}")
                             st.warning("Could not load market indices data. Please try again later.")
@@ -1010,75 +1094,90 @@ def main():
                                     st.info("Try selecting a different time period or stock.")
                                     return
                                 
-                                model, metrics, training_history = train_model(df)
-                                prediction, confidence = predict_trend(model, df, sentiment_score)
+                                model, metrics, training_history, predictions = train_model(df)
+                                prediction, confidence, model_predictions = predict_trend(model, df, sentiment_score)
                                 
+                                # Train and predict with Keras LSTM
+                                keras_model, keras_history = train_keras_lstm_model(df)
+                                keras_preds = predict_with_keras_lstm(keras_model, df)
+                                next_keras_pred = keras_preds[-1][0] if len(keras_preds) > 0 else None
+
                                 # Display results
                                 with col2:
-                                    st.subheader("Prediction Results")
-                                    
+                                    st.markdown('<div class="section-header">Prediction Results</div>', unsafe_allow_html=True)
                                     # Prediction indicator
-                                    prediction_color = "green" if prediction == 1 else "red"
+                                    prediction_color = "#27ae60" if prediction == 1 else "#c0392b"
                                     prediction_text = "UP 📈" if prediction == 1 else "DOWN 📉"
-                                    st.markdown(f"### <span style='color:{prediction_color}'>{prediction_text}</span>", unsafe_allow_html=True)
-                                    
+                                    st.markdown(f"<div class='big-metric' style='color:{prediction_color}'>{prediction_text}</div>", unsafe_allow_html=True)
                                     # Confidence meter
-                                    st.write("Confidence Score:")
-                                    st.progress(min(max(confidence, 0.0), 1.0))  # Ensure confidence is between 0 and 1
+                                    st.markdown('<div class="section-header">Confidence Score</div>', unsafe_allow_html=True)
+                                    st.progress(min(max(confidence, 0.0), 1.0))
                                     st.write(f"{confidence:.2%}")
-                                    
-                                    # Additional metrics
-                                    st.write("Model Performance:")
+                                    st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+                                    # Show only combined and Keras LSTM predictions
+                                    st.markdown('<div class="section-header">Model Predictions (next close)</div>', unsafe_allow_html=True)
+                                    st.markdown(f"<b>Hybrid Combined:</b> <span style='color:#2980b9'>{model_predictions['combined']:.2f}</span>", unsafe_allow_html=True)
+                                    if next_keras_pred is not None:
+                                        st.markdown(f"<b>Keras LSTM:</b> <span style='color:#8e44ad'>{next_keras_pred:.2f}</span>", unsafe_allow_html=True)
+                                    st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+                                    # Model Performance
+                                    st.markdown('<div class="section-header">Model Performance</div>', unsafe_allow_html=True)
                                     st.write(f"RMSE: {metrics['RMSE']:.2f}")
                                     st.write(f"MAPE: {metrics['MAPE']:.2f}%")
                                     st.write(f"Directional Accuracy: {metrics['Directional_Accuracy']:.2f}%")
                                     st.write("Sentiment Score:", f"{sentiment_score:.2f}")
-                                    
-                                    # Sentiment interpretation
+                                    # Sentiment interpretation (keep concise)
                                     if sentiment_score > 0.2:
-                                        st.write("News Sentiment: Very Positive 😊")
+                                        st.success("News Sentiment: Very Positive 😊")
                                     elif sentiment_score > 0:
-                                        st.write("News Sentiment: Slightly Positive 🙂")
+                                        st.info("News Sentiment: Slightly Positive 🙂")
                                     elif sentiment_score < -0.2:
-                                        st.write("News Sentiment: Very Negative 😟")
+                                        st.error("News Sentiment: Very Negative 😟")
                                     elif sentiment_score < 0:
-                                        st.write("News Sentiment: Slightly Negative 😕")
+                                        st.warning("News Sentiment: Slightly Negative 😕")
                                     else:
                                         st.write("News Sentiment: Neutral 😐")
-                                    
+                                    st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+                                    # Placeholder for tf-explain GradCAM visualization
+                                    st.markdown('<div class="section-header">Model Explanation (Saliency Map)</div>', unsafe_allow_html=True)
+                                    saliency, input_seq = compute_lstm_saliency_map(keras_model, df)
+                                    if saliency is not None:
+                                        fig, ax = plt.subplots(figsize=(8, 2))
+                                        ax.plot(saliency, label='Saliency (importance)')
+                                        ax.set_title('LSTM Saliency Map (last input sequence)')
+                                        ax.set_xlabel('Time Step')
+                                        ax.set_ylabel('Importance')
+                                        ax.legend()
+                                        st.pyplot(fig)
+                                    else:
+                                        st.info('Not enough data for saliency map or model not trained.')
+                                    st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
                                     # Mean Reversion Analysis
-                                    st.subheader("Mean Reversion Analysis")
-                                    
+                                    st.markdown('<div class="section-header">Mean Reversion Analysis</div>', unsafe_allow_html=True)
                                     if 'Reversion_Score' in df.columns:
                                         reversion_score = df['Reversion_Score'].iloc[-1]
                                         st.write(f"Reversion Score: {reversion_score:.1f}/6.0")
-                                        
-                                        # Reversion strength interpretation
                                         if reversion_score >= 4:
-                                            st.write("Strong potential for price reversion 🔄")
+                                            st.success("Strong potential for price reversion 🔄")
                                         elif reversion_score >= 2:
-                                            st.write("Moderate potential for price reversion ↔️")
+                                            st.info("Moderate potential for price reversion ↔️")
                                         else:
                                             st.write("Low potential for price reversion ➡️")
-                                    
                                     if 'RSI' in df.columns:
                                         rsi_value = df['RSI'].iloc[-1]
                                         st.write(f"RSI: {rsi_value:.1f}")
-                                        
                                         if rsi_value > 70:
-                                            st.write("Overbought condition - potential downward reversion")
+                                            st.warning("Overbought condition - potential downward reversion")
                                         elif rsi_value < 30:
-                                            st.write("Oversold condition - potential upward reversion")
-                                    
+                                            st.info("Oversold condition - potential upward reversion")
+                                    st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
                                     # Training History
-                                    st.subheader("Model Training History")
+                                    st.markdown('<div class="section-header">Model Training History</div>', unsafe_allow_html=True)
                                     if training_history and isinstance(training_history, dict):
-                                        # Plot training and validation loss
                                         fig, ax = plt.subplots(figsize=(10, 4))
                                         epochs = training_history.get('epochs', [])
                                         train_loss = training_history.get('train_loss', [])
                                         val_loss = training_history.get('val_loss', [])
-                                        
                                         if epochs and train_loss and val_loss:
                                             ax.plot(epochs, train_loss, label='Training Loss')
                                             ax.plot(epochs, val_loss, label='Validation Loss')
